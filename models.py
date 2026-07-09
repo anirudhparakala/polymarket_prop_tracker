@@ -6,19 +6,54 @@ and none of them may change it.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
 
 def _f(raw: dict, key: str, default: float = 0.0) -> float:
+    """Coerce a raw JSON value to a *finite* float.
+
+    The remote API is not trusted. A missing key, a non-numeric string, or a
+    non-finite number (NaN/Inf — which Python's json module parses by default
+    from the literal `NaN`/`Infinity` tokens) all collapse to the default
+    rather than propagating. A NaN that reaches the UI renders the whole
+    portfolio total as "NaN", scrambles row ordering, and silently becomes
+    NULL when written to SQLite; an Inf poisons every downstream sum. None of
+    those are recoverable once past this boundary, so they are rejected here.
+    """
     value = raw.get(key)
-    return default if value is None else float(value)
+    if value is None:
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
 
 
 def _s(raw: dict, key: str, default: str = "") -> str:
     value = raw.get(key)
     return default if value is None else str(value)
+
+
+def _b(raw: dict, key: str, default: bool = False) -> bool:
+    """Coerce a raw JSON value to a bool without the ``bool("false") is True`` trap.
+
+    A real JSON boolean arrives as a Python bool and passes straight through.
+    A string (some feeds send ``"false"``) is interpreted by content, not by
+    truthiness — ``bool("false")`` is ``True``, which would silently invert the
+    flag.
+    """
+    value = raw.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +95,7 @@ class Position:
             open_pnl=current_value - stake,
             percent_pnl=_f(raw, "percentPnl"),
             realized_pnl=_f(raw, "realizedPnl"),
-            redeemable=bool(raw.get("redeemable", False)),
+            redeemable=_b(raw, "redeemable"),
             end_date=_s(raw, "endDate"),
         )
 
