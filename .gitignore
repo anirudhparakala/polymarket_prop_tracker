@@ -59,6 +59,7 @@ venv.bak/
 
 # --- Testing / coverage -----------------------------------------------------
 .pytest_cache/
+.pytest_tmp/
 .ruff_cache/
 .mypy_cache/
 .dmypy.json
