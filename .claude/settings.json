@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./data/*.db)",
+      "Read(./data/*.sqlite)",
+      "Read(./data/*.sqlite3)",
+      "Bash(git commit --no-verify*)",
+      "Bash(git push --no-verify*)"
+    ],
+    "allow": [
+      "Bash(./.venv/Scripts/python.exe *)",
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(./.venv/Scripts/pytest *)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git add*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git *)",
+            "statusMessage": "Checking for hook bypass...",
+            "timeout": 15,
+            "command": "root=\"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}\"; for py in \"$root/.venv/Scripts/python.exe\" \"$root/.venv/bin/python\"; do if [ -x \"$py\" ]; then exec \"$py\" \"$root/scripts/guard_no_verify.py\"; fi; done; exit 0"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true,
+    "claude-md-management@claude-plugins-official": true
+  }
+}

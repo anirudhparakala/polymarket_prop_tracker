@@ -1,0 +1,97 @@
+# --- Secrets / local config -------------------------------------------------
+# NEVER commit the wallet address. It is not a cryptographic secret, but it is
+# a permanent, public, on-chain identifier: committing it here links this repo
+# (and your GitHub identity) to your full Polymarket betting history forever.
+# It lives in data/*.db and .env only. Both are ignored below.
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+wallet.txt
+*.wallet
+
+# --- Local database ---------------------------------------------------------
+# checkpoints are personal betting history; never commit them
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/*.sqlite
+data/*.sqlite3
+
+# --- Exports ----------------------------------------------------------------
+exports/
+*.csv
+*.png
+!docs/**/*.png
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Virtual environments ---------------------------------------------------
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# --- Testing / coverage -----------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+coverage.xml
+*.cover
+nosetests.xml
+
+# --- Tooling ----------------------------------------------------------------
+.python-version
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- IDE / editor -----------------------------------------------------------
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS ---------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Claude Code ------------------------------------------------------------
+# Share project settings; keep personal overrides local.
+.claude/settings.local.json
