@@ -56,34 +56,43 @@ def create_checkpoint(conn: sqlite3.Connection, wallet: str, label: str) -> int:
 def save_checkpoint_positions(
     conn: sqlite3.Connection, checkpoint_id: int, positions: list[Position]
 ) -> None:
-    conn.executemany(
-        """
-        INSERT INTO checkpoint_positions (
-            checkpoint_id, asset, condition_id, title, event_slug, outcome,
-            size, avg_price, stake, current_value, cur_price,
-            cash_pnl, percent_pnl, realized_pnl
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            (
-                checkpoint_id,
-                p.asset,
-                p.condition_id,
-                p.market_title,
-                p.event_slug,
-                p.outcome,
-                p.size,
-                p.entry_price,
-                p.stake,
-                p.current_value,
-                p.current_price,
-                p.open_pnl,
-                p.percent_pnl,
-                p.realized_pnl,
-            )
-            for p in positions
-        ],
-    )
+    try:
+        conn.executemany(
+            """
+            INSERT INTO checkpoint_positions (
+                checkpoint_id, asset, condition_id, title, event_slug, outcome,
+                size, avg_price, stake, current_value, cur_price,
+                cash_pnl, percent_pnl, realized_pnl
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    checkpoint_id,
+                    p.asset,
+                    p.condition_id,
+                    p.market_title,
+                    p.event_slug,
+                    p.outcome,
+                    p.size,
+                    p.entry_price,
+                    p.stake,
+                    p.current_value,
+                    p.current_price,
+                    p.open_pnl,
+                    p.percent_pnl,
+                    p.realized_pnl,
+                )
+                for p in positions
+            ],
+        )
+    except sqlite3.Error:
+        # executemany can partially apply inserts before raising (e.g. a
+        # duplicate (checkpoint_id, asset) pair fails the UNIQUE constraint
+        # only on the second row). Roll back so no partial batch is left
+        # sitting in the open transaction for a later, unrelated commit()
+        # elsewhere on this connection to silently persist.
+        conn.rollback()
+        raise
     conn.commit()
 
 

@@ -118,3 +118,46 @@ def test_saving_an_empty_position_list_is_allowed(conn):
     checkpoint_id = db.create_checkpoint(conn, WALLET_A, "Empty")
     db.save_checkpoint_positions(conn, checkpoint_id, [])
     assert db.load_checkpoint_positions(conn, checkpoint_id) == []
+
+
+def test_deleting_a_checkpoint_cascades_to_its_positions(conn):
+    checkpoint_id = db.create_checkpoint(conn, WALLET_A, "Before match")
+    db.save_checkpoint_positions(conn, checkpoint_id, [_position("AST1"), _position("AST2")])
+    assert len(db.load_checkpoint_positions(conn, checkpoint_id)) == 2
+
+    conn.execute("DELETE FROM checkpoints WHERE id = ?", (checkpoint_id,))
+    conn.commit()
+
+    assert db.load_checkpoint_positions(conn, checkpoint_id) == []
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM checkpoint_positions WHERE checkpoint_id = ?",
+        (checkpoint_id,),
+    ).fetchone()[0]
+    assert remaining == 0
+
+
+def test_duplicate_asset_batch_leaves_no_partial_row_after_rollback(conn):
+    """Reproduces the Finding 1 bug: executemany fails partway through a
+    batch with a duplicate (checkpoint_id, asset) pair. Without a rollback,
+    the first row of the batch would remain in the open transaction and get
+    silently committed by any later, unrelated commit() on this connection.
+    """
+    checkpoint_id = db.create_checkpoint(conn, WALLET_A, "Before match")
+
+    with pytest.raises(Exception):
+        db.save_checkpoint_positions(
+            conn, checkpoint_id, [_position("DUPE"), _position("DUPE")]
+        )
+
+    # The phantom first row must be gone even before anything else commits.
+    assert db.load_checkpoint_positions(conn, checkpoint_id) == []
+
+    # Prove it stays gone even after an unrelated commit on this same
+    # connection -- this is exactly the scenario the reviewer reproduced.
+    db.create_checkpoint(conn, WALLET_A, "Halftime")
+    assert db.load_checkpoint_positions(conn, checkpoint_id) == []
+    count = conn.execute(
+        "SELECT COUNT(*) FROM checkpoint_positions WHERE checkpoint_id = ?",
+        (checkpoint_id,),
+    ).fetchone()[0]
+    assert count == 0
