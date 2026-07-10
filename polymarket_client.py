@@ -23,7 +23,8 @@ MAX_OFFSET = 10_000
 
 TIMEOUT_SECONDS = 10
 
-WALLET_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+# Match against the already-normalized (stripped, lowercased) form.
+WALLET_RE = re.compile(r"0x[0-9a-f]{40}")
 
 
 class PolymarketError(RuntimeError):
@@ -34,13 +35,31 @@ class InvalidWalletError(ValueError):
     """The wallet address is not a 0x-prefixed 40-hex-character address."""
 
 
+def normalize_wallet(wallet: str) -> str:
+    """Canonical form of an Ethereum address for identity comparison.
+
+    Addresses are case-insensitive (EIP-55 checksum casing is display-only),
+    and copy-paste routinely adds surrounding whitespace or a trailing newline.
+    MetaMask returns all-lowercase; a block explorer shows mixed-case. Without
+    canonicalizing, the same account in two textual forms compares unequal, so
+    a user's own checkpoints silently vanish when they paste a different form.
+    """
+    return wallet.strip().lower()
+
+
 def validate_wallet(wallet: str) -> str:
-    if not isinstance(wallet, str) or not WALLET_RE.match(wallet):
+    if not isinstance(wallet, str):
         raise InvalidWalletError(
             f"Not a valid wallet address: {wallet!r}. "
             "Expected 0x followed by 40 hex characters."
         )
-    return wallet
+    normalized = normalize_wallet(wallet)
+    if not WALLET_RE.fullmatch(normalized):
+        raise InvalidWalletError(
+            f"Not a valid wallet address: {wallet!r}. "
+            "Expected 0x followed by 40 hex characters."
+        )
+    return normalized
 
 
 class PolymarketSource:
@@ -51,7 +70,9 @@ class PolymarketSource:
         self._base_url = base_url
 
     def fetch(self, wallet: str) -> list[Position]:
-        validate_wallet(wallet)
+        # Use the normalized form for the request too, so a pasted trailing
+        # newline never reaches the query string.
+        wallet = validate_wallet(wallet)
         return [Position.from_api(raw) for raw in self._fetch_all_pages(wallet)]
 
     def _fetch_all_pages(self, wallet: str) -> list[dict]:

@@ -592,9 +592,11 @@ class TestWalletValidation:
     def test_valid_address_accepted(self):
         assert pc.validate_wallet(VALID_WALLET) == VALID_WALLET
 
-    def test_mixed_case_hex_accepted(self):
+    def test_mixed_case_hex_accepted_and_normalized(self):
         mixed = "0x" + "aB3F" * 10
-        assert pc.validate_wallet(mixed) == mixed
+        # Accepted, and returned in canonical lowercase form so the same
+        # account always compares equal regardless of display casing.
+        assert pc.validate_wallet(mixed) == mixed.lower()
 
     def test_missing_0x_prefix_rejected(self):
         with pytest.raises(pc.InvalidWalletError):
@@ -612,13 +614,14 @@ class TestWalletValidation:
         with pytest.raises(pc.InvalidWalletError):
             pc.validate_wallet("0x" + "a" * 41)
 
-    def test_leading_whitespace_rejected(self):
-        with pytest.raises(pc.InvalidWalletError):
-            pc.validate_wallet(" " + VALID_WALLET)
+    def test_leading_whitespace_stripped_and_accepted(self):
+        # A pasted leading space is a copy-paste artifact, not an invalid
+        # address: it is stripped and the clean address accepted, rather than
+        # rejected or (worse) passed through raw to the network.
+        assert pc.validate_wallet(" " + VALID_WALLET) == VALID_WALLET.lower()
 
-    def test_trailing_space_rejected(self):
-        with pytest.raises(pc.InvalidWalletError):
-            pc.validate_wallet(VALID_WALLET + " ")
+    def test_trailing_space_stripped_and_accepted(self):
+        assert pc.validate_wallet(VALID_WALLET + " ") == VALID_WALLET.lower()
 
     def test_fullwidth_unicode_zero_rejected(self):
         """A full-width '0' (U+FF10) is accepted by str.isdigit() but is NOT
@@ -642,18 +645,13 @@ class TestWalletValidation:
             make_source(session).fetch("not-a-wallet")
         assert len(session.calls) == 0
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG: WALLET_RE is anchored with `$`, and `.match()` is used "
-        "instead of `.fullmatch()`. In Python regex (without MULTILINE), "
-        "`$` matches immediately before a trailing newline, so a "
-        "40-hex-char address with one trailing '\\n' appended passes "
-        "validation and would be sent to the network as a param value that "
-        "does not equal a clean, valid address.",
-    )
-    def test_trailing_newline_after_valid_address_is_rejected(self):
-        with pytest.raises(pc.InvalidWalletError):
-            pc.validate_wallet(VALID_WALLET + "\n")
+    def test_trailing_newline_is_stripped_not_sent_to_the_network(self):
+        # FIXED: validate_wallet now strips and uses fullmatch, so a trailing
+        # newline is removed and the returned value is a clean address that
+        # cannot reach the query string with an embedded newline.
+        result = pc.validate_wallet(VALID_WALLET + "\n")
+        assert "\n" not in result
+        assert result == VALID_WALLET.lower()
 
 
 # ===========================================================================

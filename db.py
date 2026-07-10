@@ -10,6 +10,18 @@ from models import CheckpointRow, Position
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
+def _normalize_wallet(wallet: str) -> str:
+    """Canonical form used as the checkpoint scoping key.
+
+    Ethereum addresses are case-insensitive and copy-paste adds whitespace, so
+    the same account pasted in a different case (or with a trailing newline)
+    must map to one identity — otherwise a user's own checkpoints become
+    invisible. Kept here (not only in the client) because this is the module
+    that does the identity comparison in SQL.
+    """
+    return wallet.strip().lower()
+
+
 def init_db(path: str | Path) -> sqlite3.Connection:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -34,7 +46,7 @@ def save_settings(
             starting_bankroll = excluded.starting_bankroll,
             updated_at        = datetime('now')
         """,
-        (wallet, bankroll),
+        (_normalize_wallet(wallet), bankroll),
     )
     conn.commit()
 
@@ -47,7 +59,7 @@ def load_settings(conn: sqlite3.Connection) -> dict | None:
 def create_checkpoint(conn: sqlite3.Connection, wallet: str, label: str) -> int:
     cursor = conn.execute(
         "INSERT INTO checkpoints (wallet_address, label) VALUES (?, ?)",
-        (wallet, label),
+        (_normalize_wallet(wallet), label),
     )
     conn.commit()
     return int(cursor.lastrowid)
@@ -104,7 +116,7 @@ def list_checkpoints(conn: sqlite3.Connection, wallet: str) -> list[dict]:
         WHERE wallet_address = ?
         ORDER BY id DESC
         """,
-        (wallet,),
+        (_normalize_wallet(wallet),),
     ).fetchall()
     return [dict(r) for r in rows]
 
