@@ -72,9 +72,9 @@ Status comes from comparing **size**, not value:
 | exists | absent | `Closed` |
 | absent | exists | `New` |
 
-A `Closed` row shows `Now = $0.00` and must **not** be colored red as a loss. Color `Closed` gray and `Reduced` yellow/orange.
+A `Closed` row shows `Now = —` (an em dash, never `$0.00` — the app only reads open positions and never sees the cashout proceeds, so `$0.00` would assert a measurement it never made). It must **not** be colored red as a loss. Color `Closed` gray and `Reduced` yellow/orange.
 
-**Stake has a fallback:** `stake = totalBought` if present, else `initialValue`. Then `open_pnl = current_value - stake`.
+**Stake is `initialValue`** (which equals `size × avgPrice`), NOT `totalBought`. `totalBought` is a *share count*, not dollars — using it as the stake yields a nonsense open PnL (e.g. −$103,707 on a position that is actually up). Then `open_pnl = current_value - stake`, which equals the API's `cashPnl` exactly.
 
 **Sort by `abs(change_since_checkpoint)` descending**, so the biggest movers surface after a goal. This is the whole point of the table.
 
