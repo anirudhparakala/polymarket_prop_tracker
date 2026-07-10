@@ -66,12 +66,25 @@ def _build_row(current: Position | None, checkpoint: CheckpointRow | None) -> Ro
 
 
 def sort_rows(rows: list[Row]) -> list[Row]:
-    """Biggest absolute mover first. Rows with no change (Closed, New) last."""
+    """Biggest absolute mover first. Rows with no change (Closed, New) last.
 
-    def key(row: Row) -> tuple[int, float]:
-        if row.change_since_checkpoint is None:
-            return (1, 0.0)
-        return (0, -abs(row.change_since_checkpoint))
+    The key is *total*: `asset` breaks every tie. Without that tiebreaker,
+    equal-magnitude movers -- and the entire Closed/New group, which all key on
+    the same value -- compare equal, so their relative order falls back to the
+    order `compare()` produced them in. That order comes from a set union,
+    whose iteration order varies with PYTHONHASHSEED between processes. The
+    table would silently reshuffle on every refresh.
+
+    A non-finite change is sorted into the "no change" tier rather than fed to
+    `abs()`, because NaN compares false against everything and would destroy
+    the total ordering.
+    """
+
+    def key(row: Row) -> tuple[int, float, str]:
+        change = row.change_since_checkpoint
+        if change is None or not math.isfinite(change):
+            return (1, 0.0, row.asset)
+        return (0, -abs(change), row.asset)
 
     return sorted(rows, key=key)
 
@@ -81,12 +94,19 @@ def compare(current: list[Position], checkpoint: list[CheckpointRow]) -> list[Ro
 
     Iterating only `current` can never discover a Closed position.
     """
+    # A repeated asset is the same prop outcome appearing twice (asset is the
+    # unique per-outcome token id), so collapsing it here is deduplication, not
+    # data loss -- and it means a duplicate row from a paginated feed cannot
+    # double-count into the summary totals.
     current_by_asset = {p.asset: p for p in current}
     checkpoint_by_asset = {c.asset: c for c in checkpoint}
 
+    # Iterate the union in sorted order: set iteration order varies with
+    # PYTHONHASHSEED, and a stable pre-sort order keeps compare() reproducible
+    # independently of sort_rows' own total key.
     rows = [
         _build_row(current_by_asset.get(asset), checkpoint_by_asset.get(asset))
-        for asset in current_by_asset.keys() | checkpoint_by_asset.keys()
+        for asset in sorted(current_by_asset.keys() | checkpoint_by_asset.keys())
     ]
     return sort_rows(rows)
 
