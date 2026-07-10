@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +16,13 @@ from models import CheckpointRow, Position, PositionSource
 from polymarket_client import InvalidWalletError, PolymarketError, PolymarketSource
 from ui import render_summary, render_table
 
-DB_PATH = Path(__file__).parent / "data" / "polymarket_tracker.db"
+# Honors POLYMARKET_TRACKER_DB when set (used by the test suite to redirect
+# at a throwaway tmp_path so tests never touch the user's real data/*.db),
+# defaulting to the real on-disk location otherwise.
+DB_PATH = Path(
+    os.environ.get("POLYMARKET_TRACKER_DB")
+    or (Path(__file__).parent / "data" / "polymarket_tracker.db")
+)
 
 
 @st.cache_resource

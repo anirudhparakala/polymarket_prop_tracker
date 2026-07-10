@@ -13,9 +13,21 @@ Part B: UI-level end-to-end acceptance (new, beyond the brief). Drives the
 real Streamlit app via streamlit.testing.v1.AppTest to prove the same
 Step-14 promise through the actual widget wiring -- toggle, selectboxes,
 buttons, and the rendered st.dataframe -- rather than only the pure
-functions underneath it. Every AppTest here repoints app.DB_PATH at a
-pytest-managed tmp_path and clears the cached @st.cache_resource connection,
-so the user's real data/*.db is never touched.
+functions underneath it.
+
+Isolation note: AppTest.run() re-execs app.py's *source* from disk into a
+fresh __main__ namespace on every call. That means mutating attributes on
+the already-imported `app_module` object (e.g. `app_module.DB_PATH = ...`)
+is inert -- the module-level `DB_PATH = ...` line simply re-runs on the next
+`.run()` and recomputes its value from scratch, ignoring whatever was poked
+onto the stale module object. The actual seam is the POLYMARKET_TRACKER_DB
+environment variable that app.py's module-level DB_PATH now reads (see
+app.py), combined with clearing Streamlit's process-wide @st.cache_resource
+cache so a connection opened under a previous test's tmp_path is never
+reused. Every AppTest in Part B goes through `_fresh_app(tmp_path,
+monkeypatch)`, which sets that env var to a per-test tmp_path and clears the
+resource cache before `AppTest.from_file(...).run()`, so the user's real
+data/*.db is never opened, read, or written.
 """
 
 from __future__ import annotations
@@ -24,6 +36,7 @@ import dataclasses
 import math
 
 import pytest
+import streamlit as st
 
 import app as app_module
 import db
@@ -80,6 +93,16 @@ def test_a_cashout_is_excluded_from_the_totals():
     summary = summarize(rows)
     assert summary.open_positions == 2  # Morocco is gone, not counted
 
+    # Guard the dollar totals too, not just the count: they must equal the
+    # sum over exactly the two surviving positions (0-0 first half and
+    # France 2-1), from the after_cashout fixture -- stake = initialValue,
+    # current_value = currentValue, since_entry = currentValue - initialValue.
+    #   0-0 first half: stake 2.0, current_value 0.0, since_entry -2.0
+    #   France 2-1:      stake 5.0, current_value 3.0, since_entry -2.0
+    assert math.isclose(summary.total_stake, 2.0 + 5.0)
+    assert math.isclose(summary.current_value, 0.0 + 3.0)
+    assert math.isclose(summary.open_pnl, -2.0 + -2.0)
+
 
 def test_surviving_props_are_unaffected_by_the_cashout():
     rows = _rows("after_cashout", "after_goal")
@@ -133,12 +156,20 @@ def test_the_full_round_trip_through_sqlite_preserves_the_join_key(tmp_path, sce
 # ===========================================================================
 
 
-def _fresh_app(tmp_path) -> AppTest:
+def _fresh_app(tmp_path, monkeypatch) -> AppTest:
     """Point the app at a throwaway DB per test so the user's real
     data/*.db is never touched, then run it once to get past the initial
-    script execution."""
-    app_module.DB_PATH = tmp_path / "acc.db"
-    app_module._connection.clear()  # drop any cached @st.cache_resource connection
+    script execution.
+
+    See the module docstring's isolation note: mutating `app_module.DB_PATH`
+    directly does nothing because AppTest re-execs app.py's source fresh
+    every `.run()`. The real seam is the POLYMARKET_TRACKER_DB env var
+    (read by app.py's module-level DB_PATH line) plus clearing Streamlit's
+    cached @st.cache_resource connection so a connection opened against a
+    previous test's tmp_path can't leak into this one.
+    """
+    monkeypatch.setenv("POLYMARKET_TRACKER_DB", str(tmp_path / "acc.db"))
+    st.cache_resource.clear()
     at = AppTest.from_file(app_module.__file__, default_timeout=30)
     at.run()
     return at
@@ -189,8 +220,8 @@ def _select_checkpoint(at: AppTest, label_prefix: str) -> None:
     assert not at.exception
 
 
-def test_fake_before_match_refresh_renders_the_three_props(tmp_path):
-    at = _fresh_app(tmp_path)
+def test_fake_before_match_refresh_renders_the_three_props(tmp_path, monkeypatch):
+    at = _fresh_app(tmp_path, monkeypatch)
     _enable_fake_data_and_refresh(at)
 
     assert len(at.dataframe) == 1
@@ -199,8 +230,8 @@ def test_fake_before_match_refresh_renders_the_three_props(tmp_path):
     assert set(raw["Market"]) == {"Morocco wins", "0-0 first half", "France 2-1"}
 
 
-def test_after_goal_vs_saved_checkpoint_morocco_is_plus_five_and_first(tmp_path):
-    at = _fresh_app(tmp_path)
+def test_after_goal_vs_saved_checkpoint_morocco_is_plus_five_and_first(tmp_path, monkeypatch):
+    at = _fresh_app(tmp_path, monkeypatch)
     _enable_fake_data_and_refresh(at)  # loads before_match
     _save_checkpoint(at, "Before match")
     _switch_scenario_and_refresh(at, "after_goal")
@@ -213,8 +244,8 @@ def test_after_goal_vs_saved_checkpoint_morocco_is_plus_five_and_first(tmp_path)
     assert math.isclose(change, 5.00)
 
 
-def test_after_cashout_morocco_is_closed_with_no_fabricated_loss(tmp_path):
-    at = _fresh_app(tmp_path)
+def test_after_cashout_morocco_is_closed_with_no_fabricated_loss(tmp_path, monkeypatch):
+    at = _fresh_app(tmp_path, monkeypatch)
     _enable_fake_data_and_refresh(at)  # loads before_match
     _save_checkpoint(at, "Before match")
     _switch_scenario_and_refresh(at, "after_cashout")
