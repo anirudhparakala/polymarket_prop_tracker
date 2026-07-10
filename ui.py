@@ -35,8 +35,12 @@ MONEY_COLUMNS = [
 PRICE_COLUMNS = ["Checkpoint Price", "Current Price", "Price Change"]
 SIZE_COLUMNS = ["Size at Checkpoint", "Current Size"]
 
-# Only these carry gain/loss meaning. Stake and Now are not wins or losses.
-PNL_COLUMNS = ["Change Since Checkpoint", "Since Entry", "Price Change"]
+# Only these carry gain/loss meaning, so only these are colored green/red.
+# Stake and Now are positions, not wins or losses. "Realized" IS a win/loss
+# (money already banked or lost on a partial cashout), so it is colored too --
+# a realized loss must read as a loss, not sit in plain black next to the
+# colored unrealized figures.
+PNL_COLUMNS = ["Change Since Checkpoint", "Since Entry", "Price Change", "Realized"]
 
 STATUS_BACKGROUND = {
     Status.OPEN.value: "",

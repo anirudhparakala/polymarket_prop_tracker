@@ -71,3 +71,24 @@ def test_empty_rows_produce_an_empty_frame_with_columns():
     frame = rows_to_frame([])
     assert frame.empty
     assert list(frame.columns) == COLUMNS
+
+
+def test_realized_pnl_is_colored_like_other_pnl_columns():
+    # A realized loss (a partial cashout at a loss) must read as a loss -- red,
+    # not plain black next to the colored unrealized figures. Symmetric for gains.
+    # pandas puts colors in a <style> block keyed by cell id, so resolve it.
+    import re
+
+    frame = rows_to_frame(compare([_position("A", size=4.0, value=2.0)],
+                                  [CheckpointRow.from_position(_position("A"))]))
+    col_idx = list(frame.columns).index("Realized")
+
+    def realized_color(value):
+        frame.loc[0, "Realized"] = value
+        html = style_frame(frame).to_html()
+        m = re.search(rf'<td id="([^"]*row0_col{col_idx})"[^>]*>', html)
+        rule = re.search(rf"#{re.escape(m.group(1))}\s*\{{([^}}]*)\}}", html)
+        return rule.group(1) if rule else ""
+
+    assert "red" in realized_color(-50.0)
+    assert "green" in realized_color(50.0)
