@@ -117,32 +117,29 @@ def test_wallet_identity_not_normalized_hides_checkpoints(tmp_path, canonical, v
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: save_settings silently stores NaN bankroll as NULL with no "
-    "exception and no warning -- the user's number is gone without a trace",
-)
-def test_nan_bankroll_silently_becomes_null(tmp_path):
+def test_nan_bankroll_is_rejected_loudly_not_silently_nulled(tmp_path):
+    """FIXED: SQLite binds NaN as NULL (https://sqlite.org/quirks.html), so the
+    user's number used to vanish into a nullable column with no exception and no
+    way to detect it. save_settings now refuses the value and names the field."""
     conn = db.init_db(tmp_path / "settings.db")
-    db.save_settings(conn, WALLET, bankroll=float("nan"))
+    with pytest.raises(ValueError, match="starting_bankroll"):
+        db.save_settings(conn, WALLET, bankroll=float("nan"))
 
-    loaded = db.load_settings(conn)
-    # A NaN bankroll is nonsensical, but silently rewriting it to None with
-    # zero signal is not "handling" it -- at minimum the round trip should
-    # preserve *some* trace that a value was supplied, not silently erase it.
-    assert loaded["starting_bankroll"] is not None or math.isnan(
-        loaded["starting_bankroll"]
-    ), "NaN bankroll vanished into NULL with no error and no way to detect it"
+    # And nothing was written: the settings row was never created.
+    assert db.load_settings(conn) is None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: one NaN field in one position (e.g. a 0/0-derived percent_pnl "
-    "from upstream API data) raises NOT NULL and wipes the ENTIRE checkpoint "
-    "batch, including otherwise-valid sibling positions, with a misleading "
-    "error message that says NOT NULL when the value was never null",
-)
-def test_nan_in_one_position_does_not_destroy_the_whole_batch(tmp_path):
+def test_nan_in_one_position_rejects_the_batch_with_a_clear_error(tmp_path):
+    """FIXED (deliberately atomic, not partial).
+
+    The original finding wanted the five valid siblings to survive. They must
+    not. A checkpoint is the baseline every later comparison is measured
+    against, so a snapshot silently missing one position -- or storing a zeroed
+    field -- would quietly corrupt every future refresh. The right behavior is to
+    reject the whole snapshot and say exactly which field of which asset is bad,
+    instead of SQLite's misleading "NOT NULL constraint failed" for a field that
+    plainly had a value.
+    """
     conn = db.init_db(tmp_path / "nan_batch.db")
     cp_id = db.create_checkpoint(conn, WALLET, "cp1")
 
@@ -150,19 +147,11 @@ def test_nan_in_one_position_does_not_destroy_the_whole_batch(tmp_path):
         make_position(asset="bad", percent_pnl=float("nan"))
     ]
 
-    try:
+    with pytest.raises(ValueError, match="percent_pnl.*'bad'"):
         db.save_checkpoint_positions(conn, cp_id, positions)
-    except sqlite3.Error:
-        pass
 
-    # Correct behavior: the five well-formed positions should have survived
-    # even if the NaN one could not be stored.
-    rows = db.load_checkpoint_positions(conn, cp_id)
-    good_assets = {r.asset for r in rows if r.asset.startswith("good")}
-    assert len(good_assets) == 5, (
-        f"expected 5 valid sibling positions to survive, found {len(good_assets)} "
-        "-- one bad float destroyed the entire checkpoint snapshot"
-    )
+    # Atomic: nothing at all persisted, no half-written snapshot.
+    assert db.load_checkpoint_positions(conn, cp_id) == []
 
 
 # ---------------------------------------------------------------------------
@@ -171,72 +160,96 @@ def test_nan_in_one_position_does_not_destroy_the_whole_batch(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: check_same_thread=False hands out one connection with no "
-    "locking; an unrelated failed write on another thread can roll back a "
-    "write whose own commit() already returned successfully with no error",
-)
-def test_concurrent_rollback_does_not_wipe_unrelated_committed_write(tmp_path):
+def test_concurrent_public_api_writes_do_not_wipe_each_other(tmp_path):
+    """FIXED: db._WRITE_LOCK serializes every write, so create_checkpoint's
+    INSERT + lastrowid + commit is atomic with respect to another thread's
+    failing batch and its rollback().
+
+    The original repro paused *between* execute() and commit() using raw SQL on
+    the shared connection. That window cannot exist once create_checkpoint holds
+    the lock across both -- but it also means a caller that bypasses db.py and
+    issues raw SQL on the shared connection is still unprotected. That is the
+    reason every write must go through this module.
+    """
     conn = db.init_db(tmp_path / "race.db")
+    start = threading.Barrier(2)
+    created: list[int] = []
+    errors: list[Exception] = []
 
-    # step1_done / step2_done give a fully deterministic interleaving (no
-    # sleeps): thread A's INSERT is guaranteed to still be uncommitted when
-    # thread B's failing batch (and its internal rollback()) runs, because
-    # thread A blocks on step2_done until thread B signals it is finished.
-    step1_done = threading.Event()
-    step2_done = threading.Event()
-    result: dict = {}
+    def writer():
+        start.wait()
+        for i in range(50):
+            try:
+                created.append(db.create_checkpoint(conn, WALLET, f"cp-{i}"))
+            except Exception as exc:  # noqa: BLE001 - test records anything
+                errors.append(exc)
 
-    def thread_a():
-        # This is exactly what create_checkpoint (db.py:47-53) does, with a
-        # deliberate pause inserted between the execute() and the commit()
-        # to make the otherwise-timing-dependent window deterministic. Two
-        # real callers of create_checkpoint on two real threads can land in
-        # this exact window purely from OS scheduling -- check_same_thread
-        # =False is what makes that legal in the first place.
-        cur = conn.execute(
-            "INSERT INTO checkpoints (wallet_address, label) VALUES (?, ?)",
-            (WALLET, "A-checkpoint"),
-        )
-        result["checkpoint_id"] = cur.lastrowid
-        step1_done.set()
-        step2_done.wait()
-        conn.commit()
-        result["a_commit_raised"] = False
+    def failing_saver():
+        start.wait()
+        for _ in range(50):
+            victim = db.create_checkpoint(conn, WALLET, "victim")
+            try:
+                # Guaranteed UNIQUE(checkpoint_id, asset) violation -> db.py's
+                # own except/rollback path fires for real, on the shared conn.
+                db.save_checkpoint_positions(
+                    conn, victim, [make_position(asset="dup"), make_position(asset="dup")]
+                )
+            except sqlite3.Error:
+                pass  # expected
 
-    def thread_b():
-        step1_done.wait()
-        cp_id_b = conn.execute(
-            "INSERT INTO checkpoints (wallet_address, label) VALUES (?, ?)",
-            (WALLET, "B-checkpoint"),
-        ).lastrowid
-        try:
-            # Guaranteed UNIQUE(checkpoint_id, asset) violation -> db.py's
-            # own except/rollback path (db.py:88-95) fires for real.
-            db.save_checkpoint_positions(
-                conn, cp_id_b, [make_position(asset="dup"), make_position(asset="dup")]
-            )
-        except sqlite3.Error:
-            pass
-        step2_done.set()
+    threads = [threading.Thread(target=writer), threading.Thread(target=failing_saver)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
-    ta = threading.Thread(target=thread_a)
-    tb = threading.Thread(target=thread_b)
-    ta.start()
-    tb.start()
-    ta.join()
-    tb.join()
-
-    assert result["a_commit_raised"] is False  # thread A's commit() never raised
-
-    rows = conn.execute(
-        "SELECT * FROM checkpoints WHERE id = ?", (result["checkpoint_id"],)
-    ).fetchall()
-    assert len(rows) == 1, (
-        "thread A's checkpoint disappeared even though its own commit() call "
-        "returned without raising -- an unrelated thread's rollback() ate it"
+    assert errors == []
+    assert len(created) == 50
+    persisted = {r[0] for r in conn.execute("SELECT id FROM checkpoints")}
+    missing = set(created) - persisted
+    assert not missing, (
+        f"{len(missing)} checkpoint(s) whose create_checkpoint() returned an id "
+        "were eaten by an unrelated thread's rollback()"
     )
+
+
+def test_concurrent_create_checkpoint_hands_out_unique_ids(tmp_path):
+    """FIXED: lastrowid is per-connection state. Without serialization a
+    concurrent INSERT overwrote it between execute() and the read, so callers
+    got duplicate ids, None (crashing on int(None)), or a row that existed in
+    the table but whose id was never returned -- an orphaned, unreachable
+    checkpoint that positions could never be attached to.
+    """
+    conn = db.init_db(tmp_path / "lastrowid.db")
+    n_threads, per_thread = 8, 25
+    start = threading.Barrier(n_threads)
+    guard = threading.Lock()
+    ids: list[int] = []
+    errors: list[Exception] = []
+
+    def worker():
+        start.wait()
+        for _ in range(per_thread):
+            try:
+                new_id = db.create_checkpoint(conn, WALLET, "cp")
+                with guard:
+                    ids.append(new_id)
+            except Exception as exc:  # noqa: BLE001 - test records anything
+                with guard:
+                    errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    expected = n_threads * per_thread
+    assert errors == [], f"concurrent create_checkpoint raised: {errors[:3]}"
+    assert len(ids) == expected
+    assert len(set(ids)) == expected, "two callers were handed the same row id"
+    rows = conn.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]
+    assert rows == expected, "orphaned rows: inserted but id never returned"
 
 
 # ---------------------------------------------------------------------------
@@ -370,10 +383,13 @@ def test_cascade_delete_removes_child_positions(tmp_path):
 
 
 def test_none_in_notnull_column_rejected_cleanly(tmp_path):
+    # FIXED: db validates the batch up front, so a None numeric fails with a
+    # TypeError naming the field instead of a raw sqlite NOT NULL message.
     conn = db.init_db(tmp_path / "none.db")
     cp_id = db.create_checkpoint(conn, WALLET, "cp1")
-    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+    with pytest.raises(TypeError, match="size.*not a number"):
         db.save_checkpoint_positions(conn, cp_id, [make_position(asset="x", size=None)])
+    assert db.load_checkpoint_positions(conn, cp_id) == []
 
 
 # ---------------------------------------------------------------------------
@@ -478,28 +494,38 @@ def test_float_precision_round_trips_exactly(tmp_path):
     assert loaded.current_price == 5e-324
 
 
-def test_inf_round_trips_through_real_column(tmp_path):
+def test_inf_is_rejected_before_it_can_poison_a_checkpoint(tmp_path):
+    # SQLite happily round-trips +/-inf through a REAL column, so nothing below
+    # this layer would have caught it. An infinite price or value is nonsense,
+    # and a checkpoint is the baseline every later comparison is measured
+    # against -- so it is rejected at the write, not stored.
     conn = db.init_db(tmp_path / "inf.db")
     cp_id = db.create_checkpoint(conn, WALLET, "cp1")
-    db.save_checkpoint_positions(
-        conn,
-        cp_id,
-        [make_position(asset="p1", entry_price=float("inf"), current_price=float("-inf"))],
-    )
-    loaded = db.load_checkpoint_positions(conn, cp_id)[0]
-    assert loaded.entry_price == float("inf")
-    assert loaded.current_price == float("-inf")
+    with pytest.raises(ValueError, match="entry_price"):
+        db.save_checkpoint_positions(
+            conn,
+            cp_id,
+            [
+                make_position(
+                    asset="p1",
+                    entry_price=float("inf"),
+                    current_price=float("-inf"),
+                )
+            ],
+        )
+    assert db.load_checkpoint_positions(conn, cp_id) == []
 
 
-def test_non_numeric_string_bypassing_the_position_contract_is_stored_literally(tmp_path):
-    """models.Position.from_api always runs values through _f()/_s(), so this
-    can only happen if some future caller builds a Position by hand with the
-    wrong type. Documented here because db.py performs no validation of its
-    own -- SQLite's REAL "type affinity" is a hint, not an enforced type, so
-    whatever the caller hands over is what gets stored."""
+def test_non_numeric_string_bypassing_the_position_contract_is_rejected(tmp_path):
+    """FIXED. models.Position.from_api runs values through _f()/_s(), so this
+    can only happen if a future caller builds a Position by hand with the wrong
+    type. SQLite's REAL "type affinity" is a hint, not an enforced type, so
+    without validation the string would be stored verbatim and silently corrupt
+    the checkpoint baseline. db now type-checks the batch before writing."""
     conn = db.init_db(tmp_path / "strtype.db")
     cp_id = db.create_checkpoint(conn, WALLET, "cp1")
-    db.save_checkpoint_positions(conn, cp_id, [make_position(asset="p1", size="not-a-number")])
-    loaded = db.load_checkpoint_positions(conn, cp_id)[0]
-    assert loaded.size == "not-a-number"
-    assert isinstance(loaded.size, str)
+    with pytest.raises(TypeError, match="size.*not a number"):
+        db.save_checkpoint_positions(
+            conn, cp_id, [make_position(asset="p1", size="not-a-number")]
+        )
+    assert db.load_checkpoint_positions(conn, cp_id) == []

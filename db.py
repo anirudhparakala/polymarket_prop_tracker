@@ -2,12 +2,55 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
+import threading
 from pathlib import Path
 
 from models import CheckpointRow, Position
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+
+# init_db hands one connection to every caller and sets check_same_thread=False,
+# so Streamlit's worker threads can share it. SQLite tracks exactly one open
+# transaction per connection handle: without serialization, an INSERT from one
+# logical operation and a rollback() from an unrelated one land in the *same*
+# implicit transaction, and the rollback silently discards a write whose own
+# commit() already returned successfully. Reads are safe; every write goes
+# through this lock.
+_WRITE_LOCK = threading.RLock()
+
+
+def _require_finite(value: float, field: str, context: str = "") -> float:
+    """Reject NaN/Inf before it reaches SQLite.
+
+    SQLite has no NaN: it binds one as NULL (https://sqlite.org/quirks.html).
+    Against a `REAL NOT NULL` column that surfaces as a baffling "NOT NULL
+    constraint failed" for a field that plainly had a value. Worse, on a
+    nullable column (starting_bankroll) it succeeds and the number is simply
+    gone. Fail loudly and name the field instead.
+
+    Checkpoints are the baseline every later comparison is measured against, so
+    a silently-wrong stored value would poison every future refresh. That is why
+    writes reject bad data rather than defaulting it the way the display path
+    does.
+    """
+    where = f" for {context}" if context else ""
+    # SQLite's REAL "type affinity" is a hint, not an enforced type: a str or
+    # None handed to a REAL NOT NULL column is stored verbatim or rejected with
+    # a confusing message. Check the type before the value.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(
+            f"{field}{where} is {value!r} ({type(value).__name__}), not a number. "
+            "SQLite would store it verbatim and corrupt the checkpoint."
+        )
+    if not math.isfinite(value):
+        raise ValueError(
+            f"{field}{where} is {value!r}, which SQLite cannot store meaningfully "
+            "(NaN binds as NULL; an infinite price or value is nonsense). "
+            "Refusing to persist it."
+        )
+    return float(value)
 
 
 def _normalize_wallet(wallet: str) -> str:
@@ -37,18 +80,21 @@ def init_db(path: str | Path) -> sqlite3.Connection:
 def save_settings(
     conn: sqlite3.Connection, wallet: str, bankroll: float | None = None
 ) -> None:
-    conn.execute(
-        """
-        INSERT INTO settings (id, wallet_address, starting_bankroll)
-        VALUES (1, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            wallet_address    = excluded.wallet_address,
-            starting_bankroll = excluded.starting_bankroll,
-            updated_at        = datetime('now')
-        """,
-        (_normalize_wallet(wallet), bankroll),
-    )
-    conn.commit()
+    if bankroll is not None:
+        _require_finite(bankroll, "starting_bankroll")
+    with _WRITE_LOCK:
+        conn.execute(
+            """
+            INSERT INTO settings (id, wallet_address, starting_bankroll)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                wallet_address    = excluded.wallet_address,
+                starting_bankroll = excluded.starting_bankroll,
+                updated_at        = datetime('now')
+            """,
+            (_normalize_wallet(wallet), bankroll),
+        )
+        conn.commit()
 
 
 def load_settings(conn: sqlite3.Connection) -> dict | None:
@@ -57,15 +103,50 @@ def load_settings(conn: sqlite3.Connection) -> dict | None:
 
 
 def create_checkpoint(conn: sqlite3.Connection, wallet: str, label: str) -> int:
-    cursor = conn.execute(
-        "INSERT INTO checkpoints (wallet_address, label) VALUES (?, ?)",
-        (_normalize_wallet(wallet), label),
-    )
-    conn.commit()
-    return int(cursor.lastrowid)
+    # INSERT, lastrowid read, and commit must be one atomic unit: lastrowid is
+    # per-connection state, so a concurrent insert can overwrite it between the
+    # execute() and the read, handing this caller someone else's row id (or None).
+    with _WRITE_LOCK:
+        cursor = conn.execute(
+            "INSERT INTO checkpoints (wallet_address, label) VALUES (?, ?)",
+            (_normalize_wallet(wallet), label),
+        )
+        checkpoint_id = cursor.lastrowid
+        conn.commit()
+    if checkpoint_id is None:  # pragma: no cover - defensive
+        raise RuntimeError("SQLite did not report a row id for the new checkpoint")
+    return int(checkpoint_id)
+
+
+_NUMERIC_FIELDS = (
+    "size",
+    "entry_price",
+    "stake",
+    "current_value",
+    "current_price",
+    "open_pnl",
+    "percent_pnl",
+    "realized_pnl",
+)
 
 
 def save_checkpoint_positions(
+    conn: sqlite3.Connection, checkpoint_id: int, positions: list[Position]
+) -> None:
+    # Validate the whole batch before touching the database. A NaN would bind as
+    # NULL and fail the REAL NOT NULL column with a misleading "NOT NULL
+    # constraint failed" naming a field that clearly had a value.
+    for position in positions:
+        for field in _NUMERIC_FIELDS:
+            _require_finite(
+                getattr(position, field), field, context=f"asset {position.asset!r}"
+            )
+
+    with _WRITE_LOCK:
+        _insert_checkpoint_positions(conn, checkpoint_id, positions)
+
+
+def _insert_checkpoint_positions(
     conn: sqlite3.Connection, checkpoint_id: int, positions: list[Position]
 ) -> None:
     try:
