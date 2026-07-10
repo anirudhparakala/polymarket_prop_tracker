@@ -67,20 +67,43 @@ def main() -> None:
     label = controls[2].text_input("Checkpoint label", placeholder="Before match")
     save_checkpoint = controls[3].button("Save checkpoint")
 
+    # Cached positions are only valid for the exact (wallet, use_fake,
+    # scenario) combination they were fetched under. Editing the wallet
+    # field, flipping the fake/real toggle, or switching the scenario is a
+    # normal Streamlit rerun -- it does NOT refetch. Without this guard,
+    # stale positions fetched for a previous wallet/source would silently be
+    # compared against -- or saved into -- a checkpoint for whatever
+    # wallet/source is currently selected (cross-wallet contamination).
+    current_source_key = (wallet, use_fake, scenario)
+
     if refresh or "positions" not in st.session_state:
         if wallet or use_fake:
             positions = _load_positions(_source(use_fake, scenario), wallet)
             if positions is not None:
                 st.session_state["positions"] = positions
+                st.session_state["positions_source_key"] = current_source_key
                 st.session_state["refreshed_at"] = datetime.now().strftime("%H:%M:%S")
 
-    positions: list[Position] = st.session_state.get("positions", [])
+    positions_stale = st.session_state.get("positions_source_key") != current_source_key
+    positions: list[Position] = [] if positions_stale else st.session_state.get("positions", [])
+    last_refreshed = "" if positions_stale else st.session_state.get("refreshed_at", "")
+
+    if positions_stale and "positions" in st.session_state:
+        st.info(
+            "Wallet or data source changed since the last fetch. "
+            "Click Refresh to load positions for the current selection."
+        )
 
     if save_checkpoint:
         if not label:
             st.warning("Give the checkpoint a label first.")
         elif not wallet:
             st.warning("Enter a wallet first.")
+        elif positions_stale:
+            st.warning(
+                "Positions are stale for the current wallet/source. "
+                "Click Refresh before saving a checkpoint."
+            )
         else:
             # create_checkpoint / save_checkpoint_positions can raise
             # ValueError/TypeError (non-finite or mistyped numeric field) or
@@ -94,18 +117,23 @@ def main() -> None:
                 st.success(f"Saved checkpoint: {label}")
 
     checkpoints = db.list_checkpoints(conn, wallet) if wallet else []
-    options = {f"{c['label']}  ({c['created_at']})": c["id"] for c in checkpoints}
+    options = {
+        f"{c['label']}  ({c['created_at']})": (c["id"], c["label"])
+        for c in checkpoints
+    }
     selected = st.selectbox("Compare against", ["(none)"] + list(options))
 
     checkpoint_rows: list[CheckpointRow] = []
+    checkpoint_label = ""
     if selected != "(none)":
-        checkpoint_rows = db.load_checkpoint_positions(conn, options[selected])
+        checkpoint_id, checkpoint_label = options[selected]
+        checkpoint_rows = db.load_checkpoint_positions(conn, checkpoint_id)
 
     rows = compare(positions, checkpoint_rows)
     render_summary(
         summarize(rows),
-        checkpoint_label="" if selected == "(none)" else selected,
-        last_refreshed=st.session_state.get("refreshed_at", ""),
+        checkpoint_label=checkpoint_label,
+        last_refreshed=last_refreshed,
     )
     render_table(rows)
 
