@@ -18,9 +18,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# 0x + exactly 40 hex chars. The trailing guard prevents matching the leading
-# 40 chars of a 64-hex conditionId, which is legitimate market data.
-WALLET_RE = re.compile(r"0x[a-fA-F0-9]{40}(?![a-fA-F0-9])")
+# 0x + exactly 40 hex chars. The prefix is case-insensitive (0x or 0X); the
+# trailing guard prevents matching the leading 40 chars of a 64-hex
+# conditionId, which is legitimate market data.
+WALLET_RE = re.compile(r"0[xX][a-fA-F0-9]{40}(?![a-fA-F0-9])")
 
 # 0x + exactly 64 hex chars is ambiguous: it is both a conditionId (safe) and a
 # raw private key (catastrophic). We only flag it near key-ish words.
@@ -36,28 +37,55 @@ ALLOWED = {
     "0xdeadbeef" + "0" * 32,
 }
 
-# Files that are allowed to contain example addresses.
-ALLOWED_PATHS = {".env.example", "scripts/check_no_secrets.py", ".gitignore"}
+# Files exempt from content scanning. These describe or exercise the detection
+# patterns themselves, so they legitimately contain address-shaped fixtures.
+# `.env.example` is deliberately NOT here: it is content-scanned so a real
+# wallet pasted "as an example" is caught (its placeholder is in ALLOWED).
+ALLOWED_PATHS = {
+    "scripts/check_no_secrets.py",
+    ".gitignore",
+    # The scanner's own adversarial test suite must contain non-placeholder
+    # addresses to prove the scanner catches them.
+    "tests/adversarial/test_secret_scanner.py",
+}
 
-# Files that must never be committed at all, whatever their contents.
-FORBIDDEN_PATHS = re.compile(r"(^|/)\.env$|(^|/)data/.*\.(db|sqlite3?)$|\.wallet$")
+# Files that must never be committed at all, whatever their contents. Matched
+# case-insensitively: on a case-insensitive filesystem (Windows/macOS) the app
+# writes data/foo.db but `git add Data/foo.db` would otherwise slip past.
+FORBIDDEN_PATHS = re.compile(
+    r"(^|/)\.env$"                       # the real .env
+    r"|(^|/)\.env\.(?!example$)[^/]*$"   # .env.local etc, but keep .env.example
+    r"|(^|/)data/.*\.(db|sqlite3?)$"     # any local database
+    r"|\.wallet$",
+    re.IGNORECASE,
+)
 
 
 def staged_files() -> list[str]:
+    # Include R (renames): a `git mv` + light edit is classified as a rename,
+    # and the default ACM filter would skip it entirely, letting a secret in a
+    # renamed file slip through.
     out = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"],
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
         capture_output=True,
-        text=True,
         check=True,
     )
-    return [line for line in out.stdout.splitlines() if line.strip()]
+    text = out.stdout.decode("utf-8", errors="replace")
+    return [line for line in text.splitlines() if line.strip()]
 
 
 def staged_blob(path: str) -> str:
     out = subprocess.run(
-        ["git", "show", f":{path}"], capture_output=True, text=True, check=False
+        ["git", "show", f":{path}"], capture_output=True, check=False
     )
-    return out.stdout if out.returncode == 0 else ""
+    if out.returncode != 0:
+        return ""
+    # Decode bytes as UTF-8 with replacement rather than relying on the
+    # platform default (cp1252 on Windows). A binary blob -- e.g. a force-added
+    # .db -- used to crash the decode; the exception was swallowed and the file
+    # treated as clean. Replacement keeps the hook alive AND still surfaces any
+    # ASCII wallet bytes embedded in that binary.
+    return out.stdout.decode("utf-8", errors="replace")
 
 
 def main() -> int:
