@@ -240,22 +240,19 @@ class TestPaginationBoundaries:
 
 
 class TestSilentDataLoss:
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG: duplicate rows returned by the server across pages are "
-        "never deduplicated; a server that ignores offset (or live data "
-        "drift that re-shows a record) silently multiplies a position in "
-        "the returned list.",
-    )
+    # FIXED: fetch() deduplicates by asset (see test body).
     def test_duplicate_rows_across_pages_are_deduplicated(self, monkeypatch):
+        # FIXED at the public boundary: _fetch_all_pages stays faithful to the
+        # raw transport (it returns every row the server sent), but fetch()
+        # deduplicates by asset. A server that ignores offset and re-emits the
+        # same record on every page collapses to a single Position instead of
+        # being multiplied -- which also protects the checkpoint save's
+        # UNIQUE(checkpoint_id, asset) constraint.
         monkeypatch.setattr(pc, "PAGE_LIMIT", 3)
         monkeypatch.setattr(pc, "MAX_OFFSET", 9)
         session = RepeatingFullPageSession(page_limit=3, hard_cap=50)
-        rows = make_source(session)._fetch_all_pages(VALID_WALLET)
-        distinct_ids = {r["conditionId"] for r in rows}
-        # A correct client would recognize these are the same 3 records
-        # repeated, not 12 distinct positions.
-        assert len(rows) == len(distinct_ids)
+        positions = make_source(session).fetch(VALID_WALLET)
+        assert len(positions) == 1
 
     @pytest.mark.xfail(
         strict=True,
@@ -312,11 +309,13 @@ class TestMalformedPayloads:
             make_source(session)._fetch_page(VALID_WALLET, 0)
 
     def test_objects_missing_every_field_normalize_to_defaults(self):
-        session = ScriptedSession([FakeResponse(200, [{}, {}])])
+        # Distinct assets so the by-asset dedup keeps both rows; the point here
+        # is that every *other* missing field normalizes to its default.
+        session = ScriptedSession([FakeResponse(200, [{"asset": "a"}, {"asset": "b"}])])
         positions = make_source(session).fetch(VALID_WALLET)
         assert len(positions) == 2
         assert positions[0] == Position(
-            asset="",
+            asset="a",
             condition_id="",
             market_title="",
             event_slug="",
@@ -346,25 +345,14 @@ class TestMalformedPayloads:
         assert p.market_title == ""
         assert p.redeemable is False
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG: a JSON array containing non-object elements (numbers, "
-        "strings, null) crashes with a raw AttributeError from inside "
-        "Position.from_api's helpers instead of a PolymarketError, breaking "
-        "the client's documented error contract.",
-    )
+    # FIXED: the client rejects a non-object array element with PolymarketError.
     def test_array_of_non_object_elements_raises_polymarket_error(self):
         session = ScriptedSession([FakeResponse(200, [1, 2, "abc", None])])
         with pytest.raises(pc.PolymarketError):
             make_source(session).fetch(VALID_WALLET)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG: response.json() is called OUTSIDE the "
-        "try/except requests.RequestException block (polymarket_client.py), "
-        "so a body that fails to parse as JSON raises a raw "
-        "requests.exceptions.JSONDecodeError instead of PolymarketError.",
-    )
+    # FIXED: response.json() is now wrapped, so a non-JSON body raises
+    # PolymarketError instead of a raw JSONDecodeError.
     def test_non_json_body_raises_polymarket_error(self):
         # A genuine requests.Response with a body that isn't JSON at all --
         # constructed entirely in memory, no socket involved.
@@ -379,13 +367,8 @@ class TestMalformedPayloads:
         with pytest.raises(pc.PolymarketError):
             make_source(OneShotSession())._fetch_page(VALID_WALLET, 0)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG: same root cause as the non-JSON-body case -- any "
-        "exception raised while decoding the body (e.g. the connection "
-        "dying mid-stream) escapes uncaught because response.json() is "
-        "called after the try/except block has already exited.",
-    )
+    # FIXED: a RequestException raised while reading the body is now caught and
+    # re-raised as PolymarketError.
     def test_body_that_dies_mid_stream_raises_polymarket_error(self):
         response = FakeResponse(200, json_exc=requests.exceptions.ChunkedEncodingError(
             "Connection broken: body ended mid-stream"
@@ -482,12 +465,8 @@ class TestTypeCoercion:
         p = Position.from_api({"size": [1, 2, 3]})
         assert p.size == 0.0
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG: an outsized integer (e.g. a corrupted sentinel value) "
-        "in a numeric field crashes with a raw OverflowError from float() "
-        "instead of being handled gracefully.",
-    )
+    # FIXED: models._f catches OverflowError (an outsized int has no float
+    # form) and falls back to the default.
     def test_huge_integer_does_not_crash_with_overflowerror(self):
         try:
             Position.from_api({"size": 10**400})
@@ -534,15 +513,8 @@ class TestHttpSemantics:
         session = ScriptedSession([FakeResponse(200, [])])
         assert make_source(session)._fetch_page(VALID_WALLET, 0) == []
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG: on a transport failure (ConnectionError, DNS failure, "
-        "etc.), the underlying requests exception's message -- which "
-        "includes the full request URL with the wallet address as a query "
-        "param -- is embedded verbatim into the raised PolymarketError via "
-        "f'Could not reach Polymarket: {exc}'. The wallet address leaks "
-        "into any log/handler that prints this exception.",
-    )
+    # FIXED: the transport-failure message reports only the exception type, not
+    # its text (which embeds the request URL with the wallet as a query param).
     def test_wallet_address_does_not_leak_into_error_message_on_connection_failure(self):
         wallet = "0x" + "b" * 40
         exc = requests.exceptions.ConnectionError(

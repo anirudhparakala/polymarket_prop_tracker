@@ -28,7 +28,8 @@ def _f(raw: dict, key: str, default: float = 0.0) -> float:
         return default
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: an outsized int (e.g. 10**400) has no float form.
         return default
     return result if math.isfinite(result) else default
 

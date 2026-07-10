@@ -73,7 +73,17 @@ class PolymarketSource:
         # Use the normalized form for the request too, so a pasted trailing
         # newline never reaches the query string.
         wallet = validate_wallet(wallet)
-        return [Position.from_api(raw) for raw in self._fetch_all_pages(wallet)]
+        # Deduplicate by asset (the unique per-outcome token id). A server that
+        # ignores offset, or live-data drift mid-pagination, can re-emit a row
+        # across pages. Keeping the last occurrence avoids inflating the list
+        # and stops a duplicate from later failing the checkpoint save's
+        # UNIQUE(checkpoint_id, asset) constraint. The last copy is the most
+        # recently fetched, so its values are freshest.
+        by_asset: dict[str, Position] = {}
+        for raw in self._fetch_all_pages(wallet):
+            position = Position.from_api(raw)
+            by_asset[position.asset] = position
+        return list(by_asset.values())
 
     def _fetch_all_pages(self, wallet: str) -> list[dict]:
         rows: list[dict] = []
@@ -100,7 +110,13 @@ class PolymarketSource:
                 timeout=TIMEOUT_SECONDS,
             )
         except requests.RequestException as exc:
-            raise PolymarketError(f"Could not reach Polymarket: {exc}") from exc
+            # Report the failure *kind* but not the exception's message: it
+            # embeds the full request URL, and the wallet address is a query
+            # param. That would leak the wallet into any log or handler that
+            # prints this error. The original is still chained for local debug.
+            raise PolymarketError(
+                f"Could not reach Polymarket ({type(exc).__name__})."
+            ) from None
 
         if response.status_code == 429:
             raise PolymarketError(
@@ -116,7 +132,21 @@ class PolymarketSource:
                 f"Unexpected response from Polymarket (HTTP {response.status_code})."
             )
 
-        payload = response.json()
+        # response.json() reads and parses the body, so it can raise a JSON
+        # decode error (a ValueError) on a non-JSON body, or a RequestException
+        # if the connection dies mid-stream. Both must surface as PolymarketError
+        # to honor the "every failure is a PolymarketError" contract.
+        try:
+            payload = response.json()
+        except (ValueError, requests.RequestException) as exc:
+            raise PolymarketError(
+                "Polymarket returned a body that could not be read as JSON."
+            ) from exc
+
         if not isinstance(payload, list):
             raise PolymarketError("Expected a JSON array of positions.")
+        # Guard each element: a non-object (number, string, null) would crash
+        # Position.from_api's dict access with a raw AttributeError.
+        if any(not isinstance(element, dict) for element in payload):
+            raise PolymarketError("Expected every position to be a JSON object.")
         return payload
