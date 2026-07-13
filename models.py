@@ -82,6 +82,12 @@ class Position:
         # stake is initialValue (dollars), NOT totalBought (shares).
         stake = _f(raw, "initialValue")
         current_value = _f(raw, "currentValue")
+        # open_pnl is DERIVED, so _f never screens it: subtracting two finite
+        # but enormous values can still overflow to +/-Inf, which would then
+        # propagate into the table and the portfolio total. Screen the result.
+        open_pnl = current_value - stake
+        if not math.isfinite(open_pnl):
+            open_pnl = 0.0
         return cls(
             asset=_s(raw, "asset"),
             condition_id=_s(raw, "conditionId"),
@@ -93,7 +99,7 @@ class Position:
             current_price=_f(raw, "curPrice"),
             stake=stake,
             current_value=current_value,
-            open_pnl=current_value - stake,
+            open_pnl=open_pnl,
             percent_pnl=_f(raw, "percentPnl"),
             realized_pnl=_f(raw, "realizedPnl"),
             redeemable=_b(raw, "redeemable"),

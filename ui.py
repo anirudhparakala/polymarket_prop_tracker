@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pandas as pd
 import streamlit as st
 
@@ -75,8 +77,41 @@ def rows_to_frame(rows: list[Row]) -> pd.DataFrame:
     return pd.DataFrame(records, columns=COLUMNS)
 
 
+def _is_renderable_number(value) -> bool:
+    """A value we can honestly print as a number.
+
+    `pd.isna` is False for +/-Inf, so an Inf would otherwise print as the literal
+    "$inf" AND get colored -- a fabricated figure styled as a real gain or loss.
+    Anything non-finite is treated as unmeasured and rendered as an em dash.
+    """
+    if value is None or isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
+
+
+def money(value) -> str:
+    """Dollars, with the sign before the currency symbol: -$50.00, not $-50.00."""
+    if not _is_renderable_number(value):
+        return "—"
+    return f"{'-' if value < 0 else ''}${abs(value):,.2f}"
+
+
+def _price(value) -> str:
+    return f"{value:.4f}" if _is_renderable_number(value) else "—"
+
+
+def _size(value) -> str:
+    return f"{value:,.2f}" if _is_renderable_number(value) else "—"
+
+
 def _colour_pnl(value) -> str:
-    if pd.isna(value) or value == 0:
+    if not _is_renderable_number(value):
+        return ""  # never paint an unmeasured or non-finite cell as a gain/loss
+    # Colour off the *displayed* (2dp) value: a sub-cent change renders as
+    # $0.00, so colouring it red would show a "loss" on a cell that reads zero.
+    if round(value, 2) == 0:
         return ""
     return "color: green" if value > 0 else "color: red"
 
@@ -97,20 +132,22 @@ def style_frame(frame: pd.DataFrame):
 
     return styler.format(
         {
-            **{c: "${:,.2f}" for c in MONEY_COLUMNS},
-            **{c: "{:.4f}" for c in PRICE_COLUMNS},
-            **{c: "{:,.2f}" for c in SIZE_COLUMNS},
+            **{c: money for c in MONEY_COLUMNS},
+            **{c: _price for c in PRICE_COLUMNS},
+            **{c: _size for c in SIZE_COLUMNS},
         },
         na_rep="—",
     )
 
 
 def render_summary(summary: Summary, checkpoint_label: str, last_refreshed: str) -> None:
+    # money() renders a non-finite total as "—" rather than the literal "$inf",
+    # so a single bad data point can never fabricate a portfolio figure.
     columns = st.columns(6)
     columns[0].metric("Open positions", summary.open_positions)
-    columns[1].metric("Total stake", f"${summary.total_stake:,.2f}")
-    columns[2].metric("Current value", f"${summary.current_value:,.2f}")
-    columns[3].metric("Open PnL", f"${summary.open_pnl:,.2f}")
+    columns[1].metric("Total stake", money(summary.total_stake))
+    columns[2].metric("Current value", money(summary.current_value))
+    columns[3].metric("Open PnL", money(summary.open_pnl))
     columns[4].metric("Checkpoint", checkpoint_label or "—")
     columns[5].metric("Last refreshed", last_refreshed or "—")
 

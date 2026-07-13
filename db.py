@@ -130,62 +130,99 @@ _NUMERIC_FIELDS = (
 )
 
 
-def save_checkpoint_positions(
-    conn: sqlite3.Connection, checkpoint_id: int, positions: list[Position]
-) -> None:
-    # Validate the whole batch before touching the database. A NaN would bind as
-    # NULL and fail the REAL NOT NULL column with a misleading "NOT NULL
-    # constraint failed" naming a field that clearly had a value.
+def _validate_positions(positions: list[Position]) -> None:
+    """Reject a bad batch BEFORE any write. A NaN would bind as NULL and fail the
+    REAL NOT NULL column with a misleading "NOT NULL constraint failed" naming a
+    field that plainly had a value."""
     for position in positions:
         for field in _NUMERIC_FIELDS:
             _require_finite(
                 getattr(position, field), field, context=f"asset {position.asset!r}"
             )
 
+
+def save_checkpoint(
+    conn: sqlite3.Connection, wallet: str, label: str, positions: list[Position]
+) -> int:
+    """Create a checkpoint AND store its positions atomically. Returns its id.
+
+    Calling create_checkpoint() then save_checkpoint_positions() is NOT atomic:
+    create_checkpoint commits the checkpoint row immediately, so if storing the
+    positions then fails, an empty phantom checkpoint is left behind. It appears
+    in the compare dropdown looking legitimate, and comparing against it reports
+    every live position as `New` -- garbage the user was told had failed to save.
+    Here either the whole snapshot lands or none of it does.
+    """
+    _validate_positions(positions)  # raises before touching the database
+
     with _WRITE_LOCK:
-        _insert_checkpoint_positions(conn, checkpoint_id, positions)
+        try:
+            cursor = conn.execute(
+                "INSERT INTO checkpoints (wallet_address, label) VALUES (?, ?)",
+                (_normalize_wallet(wallet), label),
+            )
+            checkpoint_id = cursor.lastrowid
+            if checkpoint_id is None:  # pragma: no cover - defensive
+                raise RuntimeError("SQLite did not report a row id for the checkpoint")
+            _insert_checkpoint_positions(conn, int(checkpoint_id), positions)
+            conn.commit()
+        except sqlite3.Error:
+            # Undo the checkpoint row too, not just the positions.
+            conn.rollback()
+            raise
+
+    return int(checkpoint_id)
+
+
+def save_checkpoint_positions(
+    conn: sqlite3.Connection, checkpoint_id: int, positions: list[Position]
+) -> None:
+    _validate_positions(positions)
+    with _WRITE_LOCK:
+        try:
+            _insert_checkpoint_positions(conn, checkpoint_id, positions)
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback()
+            raise
 
 
 def _insert_checkpoint_positions(
     conn: sqlite3.Connection, checkpoint_id: int, positions: list[Position]
 ) -> None:
-    try:
-        conn.executemany(
-            """
-            INSERT INTO checkpoint_positions (
-                checkpoint_id, asset, condition_id, title, event_slug, outcome,
-                size, avg_price, stake, current_value, cur_price,
-                cash_pnl, percent_pnl, realized_pnl
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    checkpoint_id,
-                    p.asset,
-                    p.condition_id,
-                    p.market_title,
-                    p.event_slug,
-                    p.outcome,
-                    p.size,
-                    p.entry_price,
-                    p.stake,
-                    p.current_value,
-                    p.current_price,
-                    p.open_pnl,
-                    p.percent_pnl,
-                    p.realized_pnl,
-                )
-                for p in positions
-            ],
-        )
-    except sqlite3.Error:
-        # executemany can partially apply inserts before raising (e.g. a
-        # duplicate (checkpoint_id, asset) pair fails the UNIQUE constraint
-        # only on the second row). Roll back so no partial batch is left
-        # sitting in the open transaction for a later, unrelated commit()
-        # elsewhere on this connection to silently persist.
-        conn.rollback()
-        raise
+    """Raw insert only. The CALLER owns the transaction (commit/rollback):
+    executemany can partially apply rows before raising (a duplicate
+    (checkpoint_id, asset) fails the UNIQUE index only on the second row), so a
+    failure must roll back whatever the caller had open -- which, for
+    save_checkpoint(), includes the checkpoint row itself."""
+    conn.executemany(
+        """
+        INSERT INTO checkpoint_positions (
+            checkpoint_id, asset, condition_id, title, event_slug, outcome,
+            size, avg_price, stake, current_value, cur_price,
+            cash_pnl, percent_pnl, realized_pnl
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                checkpoint_id,
+                p.asset,
+                p.condition_id,
+                p.market_title,
+                p.event_slug,
+                p.outcome,
+                p.size,
+                p.entry_price,
+                p.stake,
+                p.current_value,
+                p.current_price,
+                p.open_pnl,
+                p.percent_pnl,
+                p.realized_pnl,
+            )
+            for p in positions
+        ],
+    )
     conn.commit()
 
 
