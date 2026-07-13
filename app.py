@@ -8,13 +8,25 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+from dotenv import load_dotenv
 
 import db
 from calculations import compare, summarize
 from fixtures import SCENARIOS, FixtureSource
 from models import CheckpointRow, Position, PositionSource
 from polymarket_client import InvalidWalletError, PolymarketError, PolymarketSource
+from polymarket_us_client import PolymarketUSError, PolymarketUSSource
 from ui import render_summary, render_table, rows_to_frame, style_frame
+
+# Reads .env (gitignored) so the Polymarket US key/secret never live in code.
+load_dotenv()
+
+# Polymarket US accounts have no wallet address at all -- identity comes from the
+# API key -- so their checkpoints are scoped by key id instead. The key ID is an
+# identifier, not the secret; the secret is never stored.
+ACCOUNT_US = "Polymarket US"
+ACCOUNT_CRYPTO = "Polymarket (crypto)"
+ACCOUNTS = [ACCOUNT_US, ACCOUNT_CRYPTO]
 
 # Honors POLYMARKET_TRACKER_DB when set (used by the test suite to redirect
 # at a throwaway tmp_path so tests never touch the user's real data/*.db),
@@ -36,16 +48,27 @@ def _connection() -> sqlite3.Connection:
     return db.init_db(DB_PATH)
 
 
-def _source(use_fake: bool, scenario: str) -> PositionSource:
-    return FixtureSource(scenario) if use_fake else PolymarketSource()
+def _source(use_fake: bool, scenario: str, account: str) -> PositionSource:
+    if use_fake:
+        return FixtureSource(scenario)
+    if account == ACCOUNT_US:
+        # Raises MissingCredentialsError (a PolymarketUSError) if .env is unset.
+        return PolymarketUSSource()
+    return PolymarketSource()
 
 
-def _load_positions(source: PositionSource, wallet: str) -> list[Position] | None:
+def _load_positions(
+    use_fake: bool, scenario: str, account: str, wallet: str
+) -> list[Position] | None:
+    """Fetch, turning every expected failure into a readable banner.
+
+    Constructing the source can itself fail (missing US credentials), so it is
+    inside the try -- otherwise a blank .env would raise a traceback at startup.
+    """
     try:
+        source = _source(use_fake, scenario, account)
         return source.fetch(wallet)
-    except InvalidWalletError as exc:
-        st.error(str(exc))
-    except PolymarketError as exc:
+    except (InvalidWalletError, PolymarketError, PolymarketUSError) as exc:
         st.error(str(exc))
     return None
 
@@ -61,8 +84,24 @@ def main() -> None:
         st.header("Data source")
         use_fake = st.toggle("Use fake data", value=False)
         scenario = st.selectbox("Scenario", SCENARIOS) if use_fake else ""
+        # Default to whichever platform is actually configured: if a US key is
+        # present in .env, that is the account the user has. Otherwise the
+        # crypto platform, which needs no credentials at all.
+        default_account = 0 if os.environ.get("POLYMARKET_US_KEY_ID") else 1
+        account = (
+            ""
+            if use_fake
+            else st.selectbox("Account", ACCOUNTS, index=default_account)
+        )
+        if account == ACCOUNT_US:
+            st.caption(
+                "Identified by your API key in .env -- no wallet address. "
+                "Read-only: this app has no order-placing code."
+            )
 
     wallet = st.text_input("Wallet address", value=settings.get("wallet_address", ""))
+    if account == ACCOUNT_US:
+        st.caption("Wallet address is not used for Polymarket US.")
 
     controls = st.columns(4)
     if controls[0].button("Save settings") and wallet:
@@ -87,19 +126,28 @@ def main() -> None:
     # stale positions fetched for a previous wallet/source would silently be
     # compared against -- or saved into -- a checkpoint for whatever
     # wallet/source is currently selected (cross-wallet contamination).
-    current_source_key = (wallet, use_fake, scenario)
+    # Switching account type must invalidate cached positions too, or a US
+    # portfolio could be compared against a crypto wallet's checkpoint.
+    current_source_key = (wallet, use_fake, scenario, account)
 
-    # Fake-mode checkpoints live in their own namespace, still scoped per wallet.
-    # Without the prefix, a snapshot of fixture data saved while a real wallet sat
-    # in the box would appear in that wallet's dropdown and could be compared
-    # against real positions -- a confident, meaningless dashboard. A real wallet
-    # is 0x + 40 hex, so the prefix can never collide with one.
-    checkpoint_key = f"{FAKE_CHECKPOINT_PREFIX}{wallet}" if use_fake else wallet
+    # Each source gets its own checkpoint namespace, so a snapshot from one can
+    # never appear in -- or be compared against -- another's history:
+    #   fake:<wallet>   fixture data (a confident, meaningless comparison if mixed)
+    #   us:<key id>     Polymarket US has NO wallet; the key identifies the account
+    #   <wallet>        the crypto platform, scoped by address
+    # A real wallet is 0x + 40 hex, so neither prefix can ever collide with one.
+    if use_fake:
+        checkpoint_key = f"{FAKE_CHECKPOINT_PREFIX}{wallet}"
+    elif account == ACCOUNT_US:
+        checkpoint_key = f"us:{os.environ.get('POLYMARKET_US_KEY_ID', '')}"
+    else:
+        checkpoint_key = wallet
 
     # Manual refresh ONLY. Never fetch on mount: opening the app must not fire a
-    # live API call for the saved wallet before the user asks for one.
-    if refresh and (wallet or use_fake):
-        positions = _load_positions(_source(use_fake, scenario), wallet)
+    # live API call before the user asks for one. A US account needs no wallet.
+    can_fetch = use_fake or account == ACCOUNT_US or bool(wallet)
+    if refresh and can_fetch:
+        positions = _load_positions(use_fake, scenario, account, wallet)
         if positions is not None:
             st.session_state["positions"] = positions
             st.session_state["positions_source_key"] = current_source_key
@@ -134,7 +182,8 @@ def main() -> None:
             # `if not label` alone lets a whitespace-only label through, saving a
             # checkpoint that looks blank in the dropdown.
             st.warning("Give the checkpoint a label first.")
-        elif not use_fake and not wallet:
+        elif not use_fake and account != ACCOUNT_US and not wallet:
+            # Polymarket US has no wallet address -- the API key is the identity.
             st.warning("Enter a wallet first.")
         elif positions_stale:
             # Covers both "fetched for a different wallet/source" and "never

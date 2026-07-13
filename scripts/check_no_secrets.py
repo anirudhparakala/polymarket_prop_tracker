@@ -29,6 +29,17 @@ PRIVKEY_RE = re.compile(
     r"(?i)(private[_-]?key|privkey|secret[_-]?key|seed[_-]?phrase|mnemonic)"
 )
 
+# Polymarket US credentials. The SECRET can place and cancel orders -- leaking it
+# is worse than leaking a wallet address. Match an assignment with a real value,
+# so the empty placeholders in .env.example stay committable.
+US_SECRET_RE = re.compile(
+    r"(?i)POLYMARKET_US_SECRET_KEY\s*[=:]\s*[\"']?([A-Za-z0-9+/=]{16,})"
+)
+US_KEY_ID_RE = re.compile(
+    r"(?i)POLYMARKET_US_KEY_ID\s*[=:]\s*[\"']?"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+)
+
 # Placeholders that are safe to commit.
 ALLOWED = {
     "0x" + "0" * 40,
@@ -115,6 +126,13 @@ def main() -> int:
                 )
             if PRIVKEY_RE.search(line) and re.search(r"0x[a-fA-F0-9]{64}", line):
                 problems.append(f"{path}:{lineno}: looks like a private key")
+            if US_SECRET_RE.search(line):
+                problems.append(
+                    f"{path}:{lineno}: Polymarket US SECRET KEY "
+                    "(this one can place orders -- revoke it if it ever leaves .env)"
+                )
+            if US_KEY_ID_RE.search(line):
+                problems.append(f"{path}:{lineno}: Polymarket US key id")
 
     if problems:
         sys.stderr.write("\nBLOCKED: refusing to commit secrets.\n\n")

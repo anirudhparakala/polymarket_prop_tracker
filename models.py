@@ -57,6 +57,26 @@ def _b(raw: dict, key: str, default: bool = False) -> bool:
     return default
 
 
+def _money(raw: dict, key: str) -> float:
+    """Polymarket US nests money as {"value": "12.34", "currency": "USD"}."""
+    nested = raw.get(key)
+    if not isinstance(nested, dict):
+        return 0.0
+    return _f(nested, "value")
+
+
+def _finite(value: float, default: float = 0.0) -> float:
+    return value if math.isfinite(value) else default
+
+
+def _safe_div(numerator: float, denominator: float) -> float:
+    """Derived price. Zero (or non-finite) denominator yields 0.0, never a
+    ZeroDivisionError and never an Inf that would poison the table."""
+    if denominator == 0 or not math.isfinite(denominator):
+        return 0.0
+    return _finite(numerator / denominator)
+
+
 @dataclass(frozen=True, slots=True)
 class Position:
     """A live position, normalized. Raw API names never escape this class."""
@@ -104,6 +124,58 @@ class Position:
             realized_pnl=_f(raw, "realizedPnl"),
             redeemable=_b(raw, "redeemable"),
             end_date=_s(raw, "endDate"),
+        )
+
+    @classmethod
+    def from_us_api(cls, slug: str, raw: dict) -> Position:
+        """Normalize ONE Polymarket US portfolio position.
+
+        Polymarket US is a different platform with a different shape, and none of
+        the crypto API's field names apply. Notably:
+          * decimals arrive as STRINGS ("12.34"), not numbers;
+          * money is nested as {"value": "12.34", "currency": "USD"};
+          * there is NO price field at all -- price must be derived.
+
+        Mapping (each one deliberate, none guessed by name-similarity):
+          netPositionDecimal -> size          shares currently held
+          cost.value         -> stake         dollars paid for what is held
+          cashValue.value    -> current_value what it is worth now
+          realized.value     -> realized_pnl  already banked on this market
+          open_pnl = current_value - stake    (same identity as the crypto API)
+
+        `stake` is `cost`, NOT `qtyBoughtDecimal`. qtyBought is a SHARE COUNT --
+        using a share count as a dollar stake is exactly the unit confusion that
+        produced a -$103,707 "loss" on a winning position on the crypto side.
+
+        Prices are derived (value / shares) and guarded: a zero or non-finite
+        share count yields 0.0 rather than an Inf that would poison the table.
+        """
+        meta = raw.get("marketMetadata") or {}
+
+        size = _f(raw, "netPositionDecimal")
+        stake = _money(raw, "cost")
+        current_value = _money(raw, "cashValue")
+        open_pnl = _finite(current_value - stake)
+
+        return cls(
+            # The positions object is keyed by market slug, one entry per
+            # tradeable outcome, so the slug is the stable join key -- the role
+            # `asset` (the ERC-1155 token id) plays on the crypto side.
+            asset=slug,
+            condition_id=_s(meta, "slug", slug),
+            market_title=_s(meta, "title"),
+            event_slug=_s(meta, "eventSlug"),
+            outcome=_s(meta, "outcome"),
+            size=size,
+            entry_price=_safe_div(stake, size),
+            current_price=_safe_div(current_value, size),
+            stake=stake,
+            current_value=current_value,
+            open_pnl=open_pnl,
+            percent_pnl=_finite(_safe_div(open_pnl, stake) * 100.0),
+            realized_pnl=_money(raw, "realized"),
+            redeemable=_b(raw, "expired"),
+            end_date="",  # the US positions payload carries no settlement date
         )
 
 

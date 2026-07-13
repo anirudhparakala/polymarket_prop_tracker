@@ -2,5 +2,11 @@ streamlit>=1.40
 pandas>=2.2
 requests>=2.32
 
+# Polymarket US auth: Ed25519 request signing (an HMAC-style API signature --
+# it does NOT sign blockchain transactions and cannot move funds).
+cryptography>=42.0
+python-dotenv>=1.0
+
 # dev
 pytest>=8.0
+hypothesis>=6.100

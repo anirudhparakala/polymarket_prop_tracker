@@ -8,7 +8,14 @@ Full scope and build order live in [initial_plan.md](initial_plan.md). Read it b
 
 These are not style preferences. Breaking them causes real-world harm.
 
-1. **Read-only. Never trading.** This app only issues `GET` requests to Polymarket's public Data API. Never write code that signs transactions, places orders, or handles a private key, seed phrase, or API secret — not even behind a flag or in a comment. If a task seems to require one, stop and say so.
+1. **Read-only. Never trading.** This app only ever issues `GET` requests. Never write code that signs a blockchain transaction, places or cancels an order, or handles a private key or seed phrase — not even behind a flag or in a comment. If a task seems to require one, stop and say so.
+
+   **Amended for Polymarket US (deliberate, not an oversight).** Polymarket US accounts have *no wallet address* — funding is by card/bank — so their positions are invisible to the public Data API. The only way to read them is the authenticated Portfolio API, and Polymarket US offers **no read-only key scope**: the same credential can place orders. So this app *does* hold an API secret, under strict containment:
+   - The secret lives in `.env` (gitignored) only. Never in code, never in the DB, never logged, never interpolated into an exception.
+   - `polymarket_us_client.py` contains **exactly one request**: `GET /v1/portfolio/positions`. There is no order-placing code anywhere in the repo, so a bug *cannot* trade — the capability does not exist in the source. `tests/test_polymarket_us_client.py` asserts this structurally.
+   - We deliberately do **not** use the official `polymarket-us` SDK, whose client exposes `orders.place()` on the same object as `portfolio.positions()`.
+   - The Ed25519 signing there authenticates an HTTP request (like an HMAC). It does **not** sign a blockchain transaction and cannot move funds.
+   - If you are about to add a POST/PUT/order/cancel: **stop.** That is a different program.
 2. **Never commit a wallet address.** It is not a cryptographic secret, but it is a permanent on-chain identifier: committing it links this public repo to that person's entire betting history. Wallets live only in `data/*.db` (gitignored) or `.env` (gitignored). A pre-commit hook enforces this; never suggest `--no-verify` to get around it.
 3. **This repo is public and shared with friends.** It ships code, never data. No wallet, no checkpoints, no `.db` file, no CSV export.
 4. **No advice text in the UI.** Show numbers only. Never render "cash out now", "hold", "good bet". The user is looking at real money; the app reports, it does not counsel.
