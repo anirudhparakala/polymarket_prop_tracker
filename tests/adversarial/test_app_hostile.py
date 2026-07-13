@@ -409,6 +409,116 @@ def test_normalised_equal_wallet_goes_stale_but_data_stays_safe(tmp_path, monkey
     assert any(o.startswith("CP") for o in compare_options(at))  # DB still finds it
 
 
+# FIXED: was a phantom-Closed defect (compare() called with [] positions
+# whenever nothing had been fetched yet -- indistinguishable from a real
+# empty wallet). Now guarded: positions_stale short-circuits compare()
+# entirely, so it can never manufacture a fake cashout for a position that
+# was simply never fetched this session.
+def test_fresh_session_checkpoint_selected_before_refresh_shows_no_phantom_closed(
+    tmp_path, monkeypatch
+):
+    """Reproduces the confirmed defect: a returning user's wallet is
+    pre-filled from settings (it persists across sessions); they pick a
+    saved checkpoint from 'Compare against' in a BRAND NEW session, before
+    ever clicking Refresh. `positions` is [] because nothing has been
+    fetched this session -- not because anything closed. compare() must
+    never be handed that [] as if it were a real, empty portfolio, or every
+    live bet from the checkpoint reads as a phantom cashout."""
+    _StubRealSource.calls = []
+    _StubRealSource.positions = [_real_position(asset="a1", title="REAL Lakers win")]
+    monkeypatch.setattr(polymarket_client, "PolymarketSource", _StubRealSource)
+
+    # Session 1: fetch real positions for A, persist the wallet to settings,
+    # save a checkpoint of what's currently open.
+    at1 = _boot(tmp_path, monkeypatch)
+    txt(at1, "Wallet address").set_value(WALLET_A)
+    btn(at1, "Refresh").click()
+    at1.run()
+    assert markets(at1) == ["REAL Lakers win"]
+    btn(at1, "Save settings").click()
+    at1.run()
+    _save_checkpoint(at1, "Before match")
+    assert any("saved checkpoint" in s.value.lower() for s in at1.success)
+
+    # Session 2: a brand-new AppTest against the SAME db -- simulates
+    # reopening the app. The wallet field pre-fills from settings; nothing
+    # has been fetched in this fresh session.
+    at2 = _boot(tmp_path, monkeypatch)
+    assert txt(at2, "Wallet address").value == WALLET_A
+    assert markets(at2) == []  # correctly empty: nothing fetched yet
+
+    opt = next(o for o in compare_options(at2) if o.startswith("Before match"))
+    box(at2, "Compare against").set_value(opt)
+    at2.run()
+
+    # THE DEFECT: selecting the checkpoint before Refresh must not paint the
+    # live "REAL Lakers win" position (or anything else) as Closed.
+    assert markets(at2) == []
+    df = at2.dataframe[0].value if at2.dataframe else None
+    if df is not None and len(df):
+        assert "Closed" not in list(df["Size Status"])
+    assert any("refresh" in i.value.lower() for i in at2.info)
+
+
+def test_fresh_session_after_refresh_comparison_renders_normally(tmp_path, monkeypatch):
+    """Guard against over-correcting the fix above into 'never compares':
+    once the user actually clicks Refresh, the same checkpoint must compare
+    normally again, with no phantom staleness left over."""
+    _StubRealSource.calls = []
+    _StubRealSource.positions = [_real_position(asset="a1", title="REAL Lakers win")]
+    monkeypatch.setattr(polymarket_client, "PolymarketSource", _StubRealSource)
+
+    at1 = _boot(tmp_path, monkeypatch)
+    txt(at1, "Wallet address").set_value(WALLET_A)
+    btn(at1, "Refresh").click()
+    at1.run()
+    btn(at1, "Save settings").click()
+    at1.run()
+    _save_checkpoint(at1, "Before match")
+
+    at2 = _boot(tmp_path, monkeypatch)
+    opt = next(o for o in compare_options(at2) if o.startswith("Before match"))
+    box(at2, "Compare against").set_value(opt)
+    at2.run()
+    assert markets(at2) == []  # still nothing fetched this session
+
+    btn(at2, "Refresh").click()  # user actually clicks Refresh
+    at2.run()
+
+    # Now positions genuinely match the checkpoint: normal, non-phantom Open.
+    assert markets(at2) == ["REAL Lakers win"]
+    df = at2.dataframe[0].value
+    assert list(df["Size Status"]) == ["Open"]
+    assert not any(i for i in at2.info if "refresh" in i.value.lower())
+
+
+def test_wallet_case_change_after_fetch_with_checkpoint_selected_shows_no_phantom_closed(
+    tmp_path, monkeypatch
+):
+    """Same underlying wallet, different string (case-folded identically by
+    the DB layer) after a fetch, so the checkpoint stays visible in the
+    dropdown -- but nothing has been fetched under the exact current string
+    this run, so `positions` is forced to []. Selecting that still-visible
+    checkpoint must not paint every row Closed."""
+    at = _boot(tmp_path, monkeypatch)
+    _fake_refresh(at, wallet=WALLET_A)
+    _save_checkpoint(at, "Before match")
+
+    txt(at, "Wallet address").set_value(WALLET_A.upper())  # same account, no Refresh
+    at.run()
+    assert any(o.startswith("Before match") for o in compare_options(at))  # still visible
+
+    opt = next(o for o in compare_options(at) if o.startswith("Before match"))
+    box(at, "Compare against").set_value(opt)
+    at.run()
+
+    assert markets(at) == []  # no phantom Closed rows -- table stays empty
+    df = at.dataframe[0].value if at.dataframe else None
+    if df is not None and len(df):
+        assert "Closed" not in list(df["Size Status"])
+    assert any("refresh" in i.value.lower() for i in at.info)
+
+
 # ===========================================================================
 # REAL BUGS  (reproduced -> strict xfail; each flips green when fixed)
 # ===========================================================================

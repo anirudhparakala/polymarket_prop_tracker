@@ -14,7 +14,7 @@ from calculations import compare, summarize
 from fixtures import SCENARIOS, FixtureSource
 from models import CheckpointRow, Position, PositionSource
 from polymarket_client import InvalidWalletError, PolymarketError, PolymarketSource
-from ui import render_summary, render_table
+from ui import render_summary, render_table, rows_to_frame, style_frame
 
 # Honors POLYMARKET_TRACKER_DB when set (used by the test suite to redirect
 # at a throwaway tmp_path so tests never touch the user's real data/*.db),
@@ -109,11 +109,24 @@ def main() -> None:
     positions: list[Position] = [] if positions_stale else st.session_state.get("positions", [])
     last_refreshed = "" if positions_stale else st.session_state.get("refreshed_at", "")
 
-    if positions_stale and "positions" in st.session_state:
-        st.info(
-            "Wallet or data source changed since the last fetch. "
-            "Click Refresh to load positions for the current selection."
-        )
+    # Fires for BOTH "fetched for a different wallet/source" (positions IS in
+    # session_state, just under a stale key) and "never fetched this session"
+    # (a fresh session with a wallet pre-filled from settings; positions is
+    # absent entirely). The old `"positions" in st.session_state` gate on this
+    # banner suppressed it in exactly the second case -- the returning-user
+    # opening screen -- leaving that path with no warning at all right before
+    # compare() below could turn every live bet into a phantom "Closed".
+    if positions_stale:
+        if "positions" in st.session_state:
+            st.info(
+                "Wallet or data source changed since the last fetch. "
+                "Click Refresh to load positions for the current selection."
+            )
+        else:
+            st.info(
+                "No positions loaded yet. Click Refresh to load positions "
+                "for the current wallet/source before comparing."
+            )
 
     if save_checkpoint:
         clean_label = label.strip()
@@ -165,15 +178,35 @@ def main() -> None:
     checkpoint_label = ""
     if selected != "(none)":
         checkpoint_id, checkpoint_label = options[selected]
-        checkpoint_rows = db.load_checkpoint_positions(conn, checkpoint_id)
+        # Don't even bother loading the checkpoint's positions when stale --
+        # they can never be safely compared below, so there is nothing to do
+        # with them.
+        if not positions_stale:
+            checkpoint_rows = db.load_checkpoint_positions(conn, checkpoint_id)
 
-    rows = compare(positions, checkpoint_rows)
+    # NEVER compare against positions we do not actually have. compare()
+    # cannot distinguish "this position is genuinely gone" from "we have not
+    # fetched anything yet" -- both look like an empty `current` list, and an
+    # empty `current` makes every checkpoint row read as Closed. positions_stale
+    # is True in exactly the cases where `positions` above was forced to []
+    # for a reason OTHER than an honestly-empty wallet, so short-circuit here
+    # rather than let compare() manufacture a table full of fake cashouts.
+    rows = [] if positions_stale else compare(positions, checkpoint_rows)
     render_summary(
         summarize(rows),
         checkpoint_label=checkpoint_label,
         last_refreshed=last_refreshed,
     )
-    render_table(rows)
+    if positions_stale:
+        # Deliberately NOT render_table([]): that renders "No open positions
+        # for this wallet.", which implies the wallet was checked and came
+        # back empty. Nothing has been checked yet for this selection -- the
+        # banner above is the only message the user should see. Render the
+        # same empty table shape directly so there is still a table on
+        # screen, without render_table's own (wrong-for-this-case) caption.
+        st.dataframe(style_frame(rows_to_frame([])), width="stretch", hide_index=True)
+    else:
+        render_table(rows)
 
 
 if __name__ == "__main__":

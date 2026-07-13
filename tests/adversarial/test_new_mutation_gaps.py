@@ -152,8 +152,12 @@ def test_switching_source_without_refresh_marks_positions_stale(tmp_path, monkey
     at.run()
 
     # Real code blanks the stale table and warns. The A1 mutant would keep the
-    # 3 before_match rows on screen under the after_goal selection.
-    assert len(at.dataframe) == 0, "stale positions were still rendered"
+    # 3 before_match rows on screen under the after_goal selection. The app
+    # still renders a (now empty-shaped) dataframe widget rather than
+    # skipping it entirely, so assert on the ROW count being zero, not the
+    # widget count -- either way, no stale row can survive here.
+    assert len(at.dataframe) == 0 or len(at.dataframe[0].value) == 0, \
+        "stale positions were still rendered"
     assert any("changed since the last fetch" in i.value.lower() for i in at.info), \
         "stale-data banner was not shown"
 

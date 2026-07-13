@@ -447,8 +447,10 @@ def test_app_wallet_change_marks_positions_stale_no_cross_wallet_mix(tmp_path, m
     at.run()
     assert not at.exception
     # Stale guard empties positions and shows the info banner instead of the
-    # previous wallet's table.
-    assert len(at.dataframe) == 0
+    # previous wallet's table. The app still renders a (now empty-shaped)
+    # dataframe widget rather than skipping it -- what must be zero is the
+    # ROW count, not the widget count, so no stale row can survive here.
+    assert len(at.dataframe) == 0 or len(at.dataframe[0].value) == 0
     assert any("changed since the last fetch" in str(i.value) for i in at.info)
     assert not REAL_DB.exists()
 
