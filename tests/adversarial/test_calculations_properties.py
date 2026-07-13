@@ -377,20 +377,71 @@ def test_one_nan_value_does_not_poison_portfolio_total():
 
 
 # =========================================================================== #
-# DOCUMENTED SEMANTICS (passing test that pins concerning-but-arguable behavior)
+# FIXED: a PARTIAL cashout is no longer conflated with a market loss.
+#
+# This test previously pinned the bug as "documented semantics": a partial
+# cashout at a flat market reported a big negative `change_since_checkpoint`
+# and sorted to the TOP as the biggest mover, even though price_change was
+# exactly 0 -- the same conflation the product forbids for FULL cashouts,
+# committed on partial ones. change_since_checkpoint is now
+# `checkpoint_size * (current_price - checkpoint_price)`: the market move on the
+# position as it stood at the checkpoint, which the user's own trading cannot
+# manufacture. The assertions are inverted and kept as a permanent guard.
 # =========================================================================== #
-def test_partial_cashout_is_conflated_with_market_loss_DOCUMENTED():
-    """A partial cashout at a flat market is reported as a big negative
-    `change_since_checkpoint` and sorts to the TOP as the biggest mover, even
-    though price_change is exactly 0. The row does also expose size_change, but
-    the headline number conflates 'cashed out' with 'lost to the market' -- the
-    same conflation the product forbids for FULL cashouts. Pinned here so a
-    future fix is a deliberate, visible change."""
+def test_partial_cashout_at_a_flat_market_is_not_reported_as_a_loss():
+    """User sells half of a 100-share position at a dead-flat $1.00: they banked
+    $50 and the market never moved. The headline number must be 0, not -$50."""
     row = compare(
         [make_position("x", size=50.0, current_value=50.0, current_price=1.0)],
         [make_checkpoint("x", size=100.0, current_value=100.0, current_price=1.0)],
     )[0]
     assert row.status is Status.REDUCED
-    assert row.price_change == 0.0            # market did not move
-    assert row.change_since_checkpoint == -50.0  # yet reported as a -$50 change
-    assert row.size_change == -50.0           # disambiguating info is present...
+    assert row.price_change == 0.0            # market did not move...
+    assert row.change_since_checkpoint == 0.0  # ...so the headline says nothing moved
+    assert row.size_change == -50.0           # the trade is reported as a SIZE change
+
+
+def test_a_flat_partial_cashout_no_longer_hijacks_the_top_of_the_table():
+    """The fabricated -$50 used to be the largest abs(change) in the table, so it
+    sorted above every genuine mover -- taking over the one slot the product
+    exists to fill. A real $10 move must now outrank it."""
+    rows = compare(
+        [
+            make_position("cashed", size=50.0, current_value=50.0, current_price=1.0),
+            make_position("mover", size=100.0, current_value=60.0, current_price=0.6),
+        ],
+        [
+            make_checkpoint("cashed", size=100.0, current_value=100.0, current_price=1.0),
+            make_checkpoint("mover", size=100.0, current_value=50.0, current_price=0.5),
+        ],
+    )
+    assert [r.asset for r in rows] == ["mover", "cashed"]
+    assert math.isclose(rows[0].change_since_checkpoint, 10.0)
+
+
+def test_a_flat_top_up_does_not_fabricate_a_gain():
+    """The mirror image: buying 50 more shares at a flat $1.00 is spending money,
+    not winning it. The value delta would show a green +$50."""
+    row = compare(
+        [make_position("x", size=150.0, current_value=150.0, current_price=1.0)],
+        [make_checkpoint("x", size=100.0, current_value=100.0, current_price=1.0)],
+    )[0]
+    assert row.status is Status.INCREASED
+    assert row.change_since_checkpoint == 0.0
+    assert row.size_change == 50.0
+
+
+@HYP
+@given(sold=FINITE, price_now=FINITE)
+def test_the_users_own_trading_cannot_move_the_headline_number(sold, price_now):
+    """The defining property: for a fixed checkpoint and a fixed current price,
+    change_since_checkpoint is the SAME no matter how many shares the user
+    bought or sold in between. It measures the market, and only the market."""
+    checkpoint = make_checkpoint("x", size=100.0, current_price=0.5)
+    traded = compare(
+        [make_position("x", size=sold, current_price=price_now)], [checkpoint]
+    )[0]
+    untouched = compare(
+        [make_position("x", size=100.0, current_price=price_now)], [checkpoint]
+    )[0]
+    assert traded.change_since_checkpoint == untouched.change_since_checkpoint

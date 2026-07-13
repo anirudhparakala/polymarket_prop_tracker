@@ -46,8 +46,26 @@ def _build_row(current: Position | None, checkpoint: CheckpointRow | None) -> Ro
         stake=current.stake if current else (checkpoint.stake if checkpoint else None),
         checkpoint_value=checkpoint.current_value if checkpoint else None,
         current_value=current.current_value if current else None,
+        # "How the market moved the position I marked at the checkpoint."
+        #
+        # NOT `current_value - checkpoint_value`. That delta conflates the market
+        # moving with the user trading: current_value is size * price, so selling
+        # half a position at a dead-flat price shows up as a large negative
+        # "change" -- the user's banked profit rendered as the biggest red loss on
+        # screen (it sorts first, too, since sort_rows keys on abs(change)).
+        # Topping up at a flat price symmetrically fabricates a gain for merely
+        # spending money. This is the same lie the app already refuses to tell for
+        # a FULL cashout ("a cashout is not a market loss"); holding the checkpoint
+        # size fixed extends that promise to a PARTIAL one.
+        #
+        # Pricing the checkpoint's shares at both prices isolates the market: the
+        # user's own buying and selling cannot manufacture this number. When size
+        # is unchanged it is algebraically identical to the value delta, so the
+        # ordinary "market moved" case reads exactly as it always did.
         change_since_checkpoint=(
-            current.current_value - checkpoint.current_value if both else None
+            checkpoint.size * (current.current_price - checkpoint.current_price)
+            if both
+            else None
         ),
         since_entry=current.open_pnl if current else None,
         realized_pnl=current.realized_pnl if current else None,

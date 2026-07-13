@@ -4,7 +4,16 @@ from calculations import compare, summarize
 from models import CheckpointRow, Position, Status
 
 
-def _position(asset, size=10.0, value=5.0, price=0.5, stake=5.0, realized=0.0):
+def _position(asset, size=10.0, price=0.5, stake=5.0, realized=0.0):
+    """A *coherent* position: current_value is always size * price.
+
+    The real API cannot report otherwise, and a fixture that violates it (value
+    moving while price sits still) describes a market that cannot exist. That
+    matters now that change_since_checkpoint is derived from price rather than
+    value: an incoherent fixture would test arithmetic on impossible data.
+    Express "the position is worth more" by moving the *price*.
+    """
+    value = size * price
     return Position(
         asset=asset,
         condition_id="0xc",
@@ -24,9 +33,9 @@ def _position(asset, size=10.0, value=5.0, price=0.5, stake=5.0, realized=0.0):
     )
 
 
-def _checkpoint(asset, size=10.0, value=5.0, price=0.5, stake=5.0):
+def _checkpoint(asset, size=10.0, price=0.5, stake=5.0):
     return CheckpointRow.from_position(
-        _position(asset, size=size, value=value, price=price, stake=stake)
+        _position(asset, size=size, price=price, stake=stake)
     )
 
 
@@ -39,9 +48,10 @@ def _by_asset(rows):
 
 def test_same_size_is_open_even_when_value_collapses_to_zero():
     rows = _by_asset(
-        compare([_position("A", size=10.0, value=0.0)], [_checkpoint("A", size=10.0)])
+        compare([_position("A", size=10.0, price=0.0)], [_checkpoint("A", size=10.0)])
     )
     assert rows["A"].status is Status.OPEN
+    assert rows["A"].current_value == 0.0
 
 
 def test_smaller_size_is_reduced():
@@ -72,8 +82,8 @@ def test_a_resolved_market_is_open_not_closed():
     # A resolved-but-unredeemed market still appears in /positions with price
     # 1.0 or 0.0 and redeemable=True. That is a real market outcome, not a
     # cashout, and it must not be labelled Closed.
-    resolved = _position("A", size=10.0, value=10.0, price=1.0)
-    rows = _by_asset(compare([resolved], [_checkpoint("A", size=10.0, value=5.0)]))
+    resolved = _position("A", size=10.0, price=1.0)
+    rows = _by_asset(compare([resolved], [_checkpoint("A", size=10.0, price=0.5)]))
     assert rows["A"].status is Status.OPEN
     assert math.isclose(rows["A"].change_since_checkpoint, 5.0)
 
@@ -103,7 +113,7 @@ def test_compare_iterates_the_union_of_both_sides():
 
 
 def test_closed_row_reports_no_current_value_and_no_change():
-    rows = _by_asset(compare([], [_checkpoint("A", value=10.0)]))
+    rows = _by_asset(compare([], [_checkpoint("A", price=1.0)]))
     row = rows["A"]
     assert row.current_value is None
     assert row.change_since_checkpoint is None
@@ -114,7 +124,7 @@ def test_closed_row_reports_no_current_value_and_no_change():
 
 
 def test_new_row_has_no_checkpoint_side():
-    rows = _by_asset(compare([_position("A", value=7.0)], []))
+    rows = _by_asset(compare([_position("A", price=0.7)], []))
     row = rows["A"]
     assert row.checkpoint_value is None
     assert row.change_since_checkpoint is None
@@ -123,13 +133,93 @@ def test_new_row_has_no_checkpoint_side():
 
 
 # --- arithmetic -----------------------------------------------------------
+#
+# change_since_checkpoint = checkpoint_size * (current_price - checkpoint_price)
+#
+# "How the market moved the position I marked at the checkpoint." Holding the
+# size fixed at its checkpoint value is what makes the number immune to the
+# user's own buying and selling.
 
 
-def test_change_is_current_value_minus_checkpoint_value():
+def test_change_equals_the_value_delta_when_size_is_unchanged():
+    # The ordinary case -- the user did not trade, only the market moved. Here
+    # the price-based formula is algebraically identical to the old value delta,
+    # so this reads exactly as it always did.
     rows = _by_asset(
-        compare([_position("A", value=10.0)], [_checkpoint("A", value=5.0)])
+        compare([_position("A", size=10.0, price=1.0)], [_checkpoint("A", size=10.0)])
     )
-    assert math.isclose(rows["A"].change_since_checkpoint, 5.0)
+    row = rows["A"]
+    assert math.isclose(row.change_since_checkpoint, 5.0)
+    assert math.isclose(
+        row.change_since_checkpoint, row.current_value - row.checkpoint_value
+    )
+
+
+def test_partial_cashout_at_a_flat_price_is_not_a_loss():
+    # The bug this formula exists to kill: 10 shares @ $1.00 at the checkpoint,
+    # the user sells 6 at the SAME $1.00. They banked $6 and the market never
+    # moved. A value delta would report -$6.00, colored red, sorted first --
+    # the user's own profit-taking rendered as their biggest loss.
+    rows = _by_asset(
+        compare(
+            [_position("A", size=4.0, price=1.0)],
+            [_checkpoint("A", size=10.0, price=1.0)],
+        )
+    )
+    row = rows["A"]
+    assert row.status is Status.REDUCED
+    assert row.price_change == 0.0  # the market did not move...
+    assert row.change_since_checkpoint == 0.0  # ...so nothing changed
+    assert math.isclose(row.current_value - row.checkpoint_value, -6.0)  # the old lie
+
+
+def test_top_up_at_a_flat_price_is_not_a_gain():
+    # The mirror image: buying 20 more shares at a flat $1.00 is spending money,
+    # not winning it. A value delta would fabricate a green +$20.00.
+    rows = _by_asset(
+        compare(
+            [_position("A", size=30.0, price=1.0)],
+            [_checkpoint("A", size=10.0, price=1.0)],
+        )
+    )
+    row = rows["A"]
+    assert row.status is Status.INCREASED
+    assert row.change_since_checkpoint == 0.0
+    assert math.isclose(row.current_value - row.checkpoint_value, 20.0)  # the old lie
+
+
+def test_partial_cashout_after_a_real_price_move_reports_only_the_market_move():
+    # 10 shares @ $0.50 at the checkpoint; the price doubled to $1.00 and the
+    # user sold 6 into the rise. The market moved the 10 shares they marked by
+    # 10 * (1.00 - 0.50) = +$5.00. Their sale is not part of that number.
+    rows = _by_asset(
+        compare(
+            [_position("A", size=4.0, price=1.0)],
+            [_checkpoint("A", size=10.0, price=0.5)],
+        )
+    )
+    row = rows["A"]
+    assert row.status is Status.REDUCED
+    assert math.isclose(row.change_since_checkpoint, 5.0)
+    # Selling cannot change the headline number: the same market move on the
+    # same checkpointed position reports the same $5, whatever the user did.
+    untouched = _by_asset(
+        compare(
+            [_position("A", size=10.0, price=1.0)],
+            [_checkpoint("A", size=10.0, price=0.5)],
+        )
+    )
+    assert math.isclose(
+        row.change_since_checkpoint, untouched["A"].change_since_checkpoint
+    )
+
+
+def test_a_flat_price_cashout_does_not_sort_above_a_real_mover():
+    # Sorting keys on abs(change), so a fabricated change does not just mislead,
+    # it takes over the top of the table -- the one slot the product exists for.
+    current = [_position("cashed", size=1.0, price=1.0), _position("mover", price=0.9)]
+    checkpoint = [_checkpoint("cashed", size=100.0, price=1.0), _checkpoint("mover")]
+    assert [r.asset for r in compare(current, checkpoint)] == ["mover", "cashed"]
 
 
 def test_price_change_and_size_change_are_computed():
@@ -153,8 +243,12 @@ def test_size_change_percent_is_none_when_checkpoint_size_is_zero():
 
 
 def test_since_entry_is_the_positions_open_pnl():
+    # 20 shares now worth $0.60 each = $12.00 against a $5.00 stake.
     rows = _by_asset(
-        compare([_position("A", value=12.0, stake=5.0)], [_checkpoint("A")])
+        compare(
+            [_position("A", size=20.0, price=0.6, stake=5.0)],
+            [_checkpoint("A", size=20.0)],
+        )
     )
     assert math.isclose(rows["A"].since_entry, 7.0)
 
@@ -163,17 +257,18 @@ def test_since_entry_is_the_positions_open_pnl():
 
 
 def test_biggest_absolute_mover_sorts_first():
+    # All three hold 10 shares marked at $0.50. Moves: -$5.00, +$3.00, +$1.00.
     current = [
-        _position("small", value=6.0),
-        _position("big", value=0.0),
-        _position("mid", value=8.0),
+        _position("small", price=0.6),
+        _position("big", price=0.0),
+        _position("mid", price=0.8),
     ]
     checkpoint = [_checkpoint("small"), _checkpoint("big"), _checkpoint("mid")]
     assert [r.asset for r in compare(current, checkpoint)] == ["big", "mid", "small"]
 
 
 def test_closed_and_new_rows_sort_last():
-    current = [_position("moved", value=9.0), _position("fresh")]
+    current = [_position("moved", price=0.9), _position("fresh")]
     checkpoint = [_checkpoint("moved"), _checkpoint("gone")]
     ordered = [r.asset for r in compare(current, checkpoint)]
     assert ordered[0] == "moved"
@@ -184,7 +279,7 @@ def test_closed_and_new_rows_sort_last():
 
 
 def test_summary_excludes_closed_rows():
-    rows = compare([_position("A", value=10.0, stake=5.0)], [_checkpoint("A"), _checkpoint("gone")])
+    rows = compare([_position("A", price=1.0, stake=5.0)], [_checkpoint("A"), _checkpoint("gone")])
     summary = summarize(rows)
     assert summary.open_positions == 1
     assert math.isclose(summary.total_stake, 5.0)

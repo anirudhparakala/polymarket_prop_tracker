@@ -463,9 +463,14 @@ def test_app_wallet_change_marks_positions_stale_no_cross_wallet_mix(tmp_path, m
 #    colouring it, so an overflow can no longer fabricate a dollar figure.
 def test_inf_change_from_finite_inputs_should_render_missing_not_inf():
     # Two finite, from_api- and db-acceptable values whose difference overflows.
+    # change_since_checkpoint is now checkpoint_size * (price_now - price_then),
+    # so the overflow is composed through the PRICES rather than the values --
+    # the same finite-in / non-finite-out gap, on the field that now feeds the
+    # column. (A real curPrice is a probability in [0,1]; these are hostile
+    # inputs that models._f nonetheless accepts, being finite.)
     rows = compare(
-        [pos("A", current_value=1.5e308)],
-        [ckpt(pos("A", current_value=-1e308))],
+        [pos("A", current_price=1.5e308)],
+        [ckpt(pos("A", current_price=-1e308))],
     )
     assert not math.isfinite(rows[0].change_since_checkpoint)  # compose produced inf
     frame, html = _render(rows)
