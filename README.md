@@ -25,6 +25,21 @@ bypass it with `--no-verify`.
 If anything ever asks you for a **private key**, **seed phrase**, or
 mnemonic, it is not this project — do not paste it anywhere.
 
+## Which Polymarket are you on?
+
+There are two, and they work completely differently. Pick yours:
+
+| | **Polymarket US** | **Polymarket (crypto)** |
+|---|---|---|
+| Who | US users; sign up with phone/email | Global; on-chain |
+| Funding | Bank card / transfer | USDC on Polygon |
+| Wallet address | **None at all** | A proxy wallet (`0x…`) |
+| This app needs | An API key in `.env` | Just your public address |
+
+If you fund with a card and have never seen a `0x…` address, you're on
+**Polymarket US** — your positions are invisible to the public crypto API, and
+you need the API-key route below.
+
 ## Setup
 
 Requires Python 3.13.
@@ -37,6 +52,54 @@ py -3.13 -m venv .venv
 
 The last line installs the pre-commit hook described above. Re-run it any
 time (e.g. after cloning fresh) — it's idempotent.
+
+### If you're on Polymarket US
+
+Generate an API key at [polymarket.us/developer](https://polymarket.us/developer),
+then:
+
+```bash
+cp .env.example .env      # then fill in SECTION A
+```
+
+**Read this before you paste that key.** Polymarket US does **not** offer
+read-only API keys — the same credential that reads your positions **can place
+and cancel orders**. We can't scope it down; that's their design.
+
+So this app contains the risk *structurally* rather than by promising to behave:
+`polymarket_us_client.py` has **exactly one request in it** — `GET
+/v1/portfolio/positions`. There is **no order-placing code anywhere in this
+repo**, so a bug cannot trade; the capability doesn't exist in the source. A test
+asserts this by parsing the module. (We deliberately don't use Polymarket's
+official SDK, whose client exposes `orders.place()` next to
+`portfolio.positions()`.)
+
+Still: treat that key like a password. Keep it in `.env` (gitignored, and the
+pre-commit hook blocks it). Never paste it into a chat, an issue, or a
+screenshot. **Revoke it when you stop using this dashboard.**
+
+Verify it works before trusting any number:
+
+```bash
+.venv/Scripts/python.exe scripts/check_us_account.py
+```
+
+That prints what you paid, what it's worth, and the derived price for each
+position. **Check them against your Polymarket app.** Note that `you paid`
+includes fees — a bet whose market hasn't moved can still show a small loss,
+because the fee is real money you spent. (Verified: this matches what the
+Polymarket app shows.)
+
+### If you're on Polymarket (crypto)
+
+No key needed — your position data is public. All it takes is your proxy wallet
+address, from your profile URL (`polymarket.com/profile/0x…`). Check it with:
+
+```bash
+.venv/Scripts/python.exe scripts/check_wallet.py 0xYourAddress
+```
+
+If it lists your bets, paste that address into the app.
 
 ## Run
 
