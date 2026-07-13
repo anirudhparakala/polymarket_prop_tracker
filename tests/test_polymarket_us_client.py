@@ -84,6 +84,75 @@ def _position_payload(slug="fra-2-1-esp", net="40", cost="12.00", cash="30.00"):
     }
 
 
+# The REAL shape, captured from a live account. The published docs omitted
+# avgPx, fees, baseCost, team and subject entirely -- so these are pinned here.
+REAL_TEAM_POSITION = {
+    "avgPx": {"currency": "USD", "value": "0.1900"},
+    "baseCost": {"currency": "USD", "value": "9.3595"},
+    "cost": {"currency": "USD", "value": "9.8170"},  # = baseCost + fees
+    "fees": {"currency": "USD", "value": "0.4570"},
+    "cashValue": {"currency": "USD", "value": "9.0492"},
+    "realized": {"currency": "USD", "value": "0.0000"},
+    "netPositionDecimal": "51.7100",
+    "qtyBoughtDecimal": "51.7100",
+    "expired": False,
+    "marketMetadata": {
+        "eventSlug": "f-wc-2026-07-19-winner",
+        "outcome": "Yes",  # useless on its own -- every row says "Yes"
+        "slug": "tec-f-wc-2026-07-19-winner-arg",
+        "team": {"name": "Argentina", "displayAbbreviation": "ARG"},
+        "title": "World Cup Winner",
+    },
+}
+
+REAL_SUBJECT_POSITION = {
+    "avgPx": {"currency": "USD", "value": "0.1050"},
+    "baseCost": {"currency": "USD", "value": "0.9490"},
+    "cost": {"currency": "USD", "value": "0.9990"},
+    "fees": {"currency": "USD", "value": "0.0500"},
+    "cashValue": {"currency": "USD", "value": "0.9490"},
+    "realized": {"currency": "USD", "value": "0.0000"},
+    "netPositionDecimal": "9.4900",
+    "expired": False,
+    "marketMetadata": {
+        "eventSlug": "fwc-fra-esp-2026-07-14",
+        "outcome": "Yes",
+        "slug": "atc-fwc-fra-esp-2026-07-14-exact-score-2-1",
+        "subject": {"name": "FRA wins 2-1"},
+        "title": "France vs. Spain",
+    },
+}
+
+
+def test_the_bet_the_user_actually_made_is_shown_not_just_yes():
+    """marketMetadata.outcome is "Yes" on EVERY row. Hold Argentina AND Brazil
+    to win the same World Cup and both rows would be indistinguishable. The real
+    selection lives in team.name / subject.name."""
+    argentina = Position.from_us_api("tec-f-wc-2026-07-19-winner-arg", REAL_TEAM_POSITION)
+    assert argentina.market_title == "World Cup Winner"
+    assert argentina.outcome == "Argentina"  # not "Yes"
+
+    score = Position.from_us_api("atc-...-2-1", REAL_SUBJECT_POSITION)
+    assert score.market_title == "France vs. Spain"
+    assert score.outcome == "FRA wins 2-1"  # not "Yes"
+
+
+def test_entry_price_uses_the_apis_own_avgPx_not_a_re_derivation():
+    p = Position.from_us_api("x", REAL_TEAM_POSITION)
+    assert p.entry_price == 0.19  # the API's avgPx, authoritative
+
+
+def test_stake_is_cost_including_fees_so_a_flat_market_shows_the_fee():
+    """cost = baseCost + fees. The France position's cashValue EQUALS its
+    baseCost -- the market has not moved at all -- so its entire small loss is
+    the fee. Reporting `stake` as what actually left the account tells the truth:
+    you are down by the fee."""
+    p = Position.from_us_api("x", REAL_SUBJECT_POSITION)
+    assert p.stake == 0.999  # cost, incl. the $0.05 fee
+    assert p.current_value == 0.949  # == baseCost: the market is flat
+    assert p.open_pnl == pytest.approx(-0.05)  # entirely the fee
+
+
 def _source(session, secret):
     return PolymarketUSSource(key_id=KEY_ID, secret_key=secret, session=session)
 

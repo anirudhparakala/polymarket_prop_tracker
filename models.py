@@ -136,10 +136,12 @@ class Position:
           * money is nested as {"value": "12.34", "currency": "USD"};
           * there is NO price field at all -- price must be derived.
 
-        Mapping (each one deliberate, none guessed by name-similarity):
+        Mapping (each one verified against a REAL payload, not inferred from the
+        docs -- which omitted avgPx, fees, baseCost, team and subject entirely):
           netPositionDecimal -> size          shares currently held
-          cost.value         -> stake         dollars paid for what is held
+          cost.value         -> stake         dollars paid, INCLUDING fees
           cashValue.value    -> current_value what it is worth now
+          avgPx.value        -> entry_price   the API's own average fill price
           realized.value     -> realized_pnl  already banked on this market
           open_pnl = current_value - stake    (same identity as the crypto API)
 
@@ -147,15 +149,33 @@ class Position:
         using a share count as a dollar stake is exactly the unit confusion that
         produced a -$103,707 "loss" on a winning position on the crypto side.
 
-        Prices are derived (value / shares) and guarded: a zero or non-finite
-        share count yields 0.0 rather than an Inf that would poison the table.
+        FEES: cost = baseCost + fees. We use `cost`, i.e. what actually left the
+        account, so a position that has not moved but cost a fee shows that fee
+        as a small loss. That is true: you are down by the fee.
+
+        OUTCOME: marketMetadata.outcome is a useless "Yes" on every row. The bet
+        the user actually made is in `team.name` ("Argentina") or `subject.name`
+        ("FRA wins 2-1"). Without it, two bets in the same event render as two
+        identical rows -- hold Argentina AND Brazil to win and you could not tell
+        them apart.
+
+        current_price has no field in the payload, so it is derived (value /
+        shares) and guarded: a zero or non-finite share count yields 0.0 rather
+        than an Inf that would poison the table.
         """
         meta = raw.get("marketMetadata") or {}
 
         size = _f(raw, "netPositionDecimal")
-        stake = _money(raw, "cost")
+        stake = _money(raw, "cost")  # includes fees; see FEES above
         current_value = _money(raw, "cashValue")
         open_pnl = _finite(current_value - stake)
+
+        # The specific selection: a team ("Argentina") for a winner market, a
+        # subject ("FRA wins 2-1") for a score market. Fall back to the bare
+        # Yes/No only if neither is present.
+        team = meta.get("team") if isinstance(meta.get("team"), dict) else {}
+        subject = meta.get("subject") if isinstance(meta.get("subject"), dict) else {}
+        selection = _s(team, "name") or _s(subject, "name") or _s(meta, "outcome")
 
         return cls(
             # The positions object is keyed by market slug, one entry per
@@ -165,9 +185,11 @@ class Position:
             condition_id=_s(meta, "slug", slug),
             market_title=_s(meta, "title"),
             event_slug=_s(meta, "eventSlug"),
-            outcome=_s(meta, "outcome"),
+            outcome=selection,
             size=size,
-            entry_price=_safe_div(stake, size),
+            # The API reports its own average fill price -- use it rather than
+            # re-deriving cost/shares and disagreeing with the source of truth.
+            entry_price=_money(raw, "avgPx") or _safe_div(stake, size),
             current_price=_safe_div(current_value, size),
             stake=stake,
             current_value=current_value,
